@@ -1,0 +1,87 @@
+/*
+ * Copyright (c) 2018 Jan Henrik Weinstock <jan.weinstock@rwth-aachen.de>
+ *
+ * SPDX-License-Identifier: GPL-2.0
+ *
+ * Device tree for the OpenRISC Multicore Virtual Platform (or1kmvp)
+ */
+
+/dts-v1/;
+
+/ {
+	compatible = "openrisc,or1kmvp";
+	#address-cells = <1>;
+	#size-cells = <1>;
+	interrupt-parent = <&pic>;
+
+	aliases {
+		serial0 = "/serial@90000000";
+		serial1 = "/serial@91000000";
+		ethernet0 = "/ethernet@92000000";
+	};
+
+	chosen {
+		bootargs = "debug earlycon console=ttyS0,115200n8";
+		stdout-path = "serial0:115200n8";
+	};
+
+	cpus {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			device_type = "cpu";
+			compatible = "openrisc,or1kiss";
+			clock-frequency = <100000000>; /* 100MHz */
+			reg = <0>;
+		};
+
+		cpu@1 {
+			device_type = "cpu";
+			compatible = "openrisc,or1kiss";
+			clock-frequency = <100000000>; /* 100MHz */
+			reg = <1>;
+		};
+	};
+
+	pic: interrupt-controller {
+		compatible = "opencores,or1k-pic-level";
+		#interrupt-cells = <1>;
+		interrupt-controller;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00000000 0x08000000>; /* 128MB */
+	};
+
+	serial@90000000 {
+		compatible = "ns16550a";
+		clock-frequency = <3686400>; /* 3.6864MHz */
+		reg = <0x90000000 0x2000>;
+		interrupts = <2>;
+	};
+
+	serial@91000000 {
+		compatible = "ns16550a";
+		clock-frequency = <3686400>; /* 3.6864MHz */
+		reg = <0x91000000 0x2000>;
+		interrupts = <3>;
+	};
+
+	ethernet@92000000 {
+		compatible = "opencores,ethoc";
+		reg = <0x92000000 0x2000>;
+		interrupts = <4>;
+		big-endian;
+	};
+
+	ompic@98000000 {
+		compatible = "openrisc,ompic";
+		reg = <0x98000000 0x2000>;
+		interrupt-controller;
+		interrupts = <1>;
+	};
+
+};
+
