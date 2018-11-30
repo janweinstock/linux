@@ -15,6 +15,7 @@
 #include <linux/cpu.h>
 #include <linux/sched.h>
 #include <linux/irq.h>
+#include <linux/of.h>
 #include <asm/cpuinfo.h>
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
@@ -67,14 +68,25 @@ void __init smp_init_cpus(void)
 
 void __init smp_prepare_cpus(unsigned int max_cpus)
 {
-	int i;
+	u32 cpu_id;
+	struct device_node *cpu, *cpus;
 
 	/*
 	 * Initialise the present map, which describes the set of CPUs
 	 * actually populated at the present time.
 	 */
-	for (i = 0; i < max_cpus; i++)
-		set_cpu_present(i, true);
+	cpus = of_find_node_by_path("/cpus");
+	for_each_child_of_node(cpus, cpu) {
+		if (of_property_read_u32(cpu, "reg", &cpu_id)) {
+			pr_warn("%s missing reg property", cpu->full_name);
+			continue;
+		}
+
+		if (cpu_id >= max_cpus)
+			continue;
+
+		set_cpu_present(cpu_id, true);
+	}
 }
 
 void __init smp_cpus_done(unsigned int max_cpus)
