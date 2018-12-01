@@ -113,10 +113,16 @@ static int opencores_kbd_probe(struct platform_device *pdev)
 	return 0;
 }
 
+static const struct of_device_id opencores_kbd_of_match[] = {
+	{ .compatible = "opencores,kbd" },
+	{ },
+};
+
 static struct platform_driver opencores_kbd_device_driver = {
 	.probe    = opencores_kbd_probe,
 	.driver   = {
 		.name = "opencores-kbd",
+		.of_match_table = opencores_kbd_of_match,
 	},
 };
 module_platform_driver(opencores_kbd_device_driver);
