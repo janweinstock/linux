@@ -40,7 +40,6 @@
 #include <linux/pci.h>
 #include <linux/slab.h>
 #include <linux/string.h>
-#include <linux/bitops.h>
 #include "qed.h"
 #include "qed_cxt.h"
 #include "qed_dev_api.h"
@@ -1531,7 +1530,7 @@ void qed_qm_init_pf(struct qed_hwfn *p_hwfn,
 }
 
 /* CM PF */
-void qed_cm_init_pf(struct qed_hwfn *p_hwfn)
+static void qed_cm_init_pf(struct qed_hwfn *p_hwfn)
 {
 	/* XCM pure-LB queue */
 	STORE_RT_REG(p_hwfn, XCM_REG_CON_PHY_Q3_RT_OFFSET,

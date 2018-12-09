@@ -16,7 +16,6 @@
 #include <linux/netlink.h>
 #include <linux/rtnetlink.h>
 #include <linux/types.h>
-#include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/ioctl.h>
@@ -106,6 +105,9 @@ static int load_and_attach(const char *event, struct bpf_insn *prog, int size)
 		printf("Unknown event '%s'\n", event);
 		return -1;
 	}
+
+	if (prog_cnt == MAX_PROGS)
+		return -1;
 
 	fd = bpf_load_program(prog_type, prog, insns_cnt, license, kern_version,
 			      bpf_log_buf, BPF_LOG_BUF_SIZE);

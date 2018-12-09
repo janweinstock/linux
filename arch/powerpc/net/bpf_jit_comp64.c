@@ -13,6 +13,7 @@
  */
 #include <linux/moduleloader.h>
 #include <asm/cacheflush.h>
+#include <asm/asm-compat.h>
 #include <linux/netdevice.h>
 #include <linux/filter.h>
 #include <linux/if_vlan.h>
@@ -165,7 +166,33 @@ static void bpf_jit_build_epilogue(u32 *image, struct codegen_context *ctx)
 	PPC_BLR();
 }
 
-static void bpf_jit_emit_func_call(u32 *image, struct codegen_context *ctx, u64 func)
+static void bpf_jit_emit_func_call_hlp(u32 *image, struct codegen_context *ctx,
+				       u64 func)
+{
+#ifdef PPC64_ELF_ABI_v1
+	/* func points to the function descriptor */
+	PPC_LI64(b2p[TMP_REG_2], func);
+	/* Load actual entry point from function descriptor */
+	PPC_BPF_LL(b2p[TMP_REG_1], b2p[TMP_REG_2], 0);
+	/* ... and move it to LR */
+	PPC_MTLR(b2p[TMP_REG_1]);
+	/*
+	 * Load TOC from function descriptor at offset 8.
+	 * We can clobber r2 since we get called through a
+	 * function pointer (so caller will save/restore r2)
+	 * and since we don't use a TOC ourself.
+	 */
+	PPC_BPF_LL(2, b2p[TMP_REG_2], 8);
+#else
+	/* We can clobber r12 */
+	PPC_FUNC_ADDR(12, func);
+	PPC_MTLR(12);
+#endif
+	PPC_BLRL();
+}
+
+static void bpf_jit_emit_func_call_rel(u32 *image, struct codegen_context *ctx,
+				       u64 func)
 {
 	unsigned int i, ctx_idx = ctx->idx;
 
@@ -272,7 +299,7 @@ static int bpf_jit_build_body(struct bpf_prog *fp, u32 *image,
 {
 	const struct bpf_insn *insn = fp->insnsi;
 	int flen = fp->len;
-	int i;
+	int i, ret;
 
 	/* Start of epilogue code - will only be valid 2nd pass onwards */
 	u32 exit_addr = addrs[flen];
@@ -283,9 +310,11 @@ static int bpf_jit_build_body(struct bpf_prog *fp, u32 *image,
 		u32 src_reg = b2p[insn[i].src_reg];
 		s16 off = insn[i].off;
 		s32 imm = insn[i].imm;
+		bool func_addr_fixed;
+		u64 func_addr;
 		u64 imm64;
-		u8 *func;
 		u32 true_cond;
+		u32 tmp_idx;
 
 		/*
 		 * addrs[] maps a BPF bytecode address into a real offset from
@@ -637,11 +666,7 @@ emit_clear:
 		case BPF_STX | BPF_XADD | BPF_W:
 			/* Get EA into TMP_REG_1 */
 			PPC_ADDI(b2p[TMP_REG_1], dst_reg, off);
-			/* error if EA is not word-aligned */
-			PPC_ANDI(b2p[TMP_REG_2], b2p[TMP_REG_1], 0x03);
-			PPC_BCC_SHORT(COND_EQ, (ctx->idx * 4) + 12);
-			PPC_LI(b2p[BPF_REG_0], 0);
-			PPC_JMP(exit_addr);
+			tmp_idx = ctx->idx * 4;
 			/* load value from memory into TMP_REG_2 */
 			PPC_BPF_LWARX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1], 0);
 			/* add value from src_reg into this */
@@ -649,32 +674,16 @@ emit_clear:
 			/* store result back */
 			PPC_BPF_STWCX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1]);
 			/* we're done if this succeeded */
-			PPC_BCC_SHORT(COND_EQ, (ctx->idx * 4) + (7*4));
-			/* otherwise, let's try once more */
-			PPC_BPF_LWARX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1], 0);
-			PPC_ADD(b2p[TMP_REG_2], b2p[TMP_REG_2], src_reg);
-			PPC_BPF_STWCX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1]);
-			/* exit if the store was not successful */
-			PPC_LI(b2p[BPF_REG_0], 0);
-			PPC_BCC(COND_NE, exit_addr);
+			PPC_BCC_SHORT(COND_NE, tmp_idx);
 			break;
 		/* *(u64 *)(dst + off) += src */
 		case BPF_STX | BPF_XADD | BPF_DW:
 			PPC_ADDI(b2p[TMP_REG_1], dst_reg, off);
-			/* error if EA is not doubleword-aligned */
-			PPC_ANDI(b2p[TMP_REG_2], b2p[TMP_REG_1], 0x07);
-			PPC_BCC_SHORT(COND_EQ, (ctx->idx * 4) + (3*4));
-			PPC_LI(b2p[BPF_REG_0], 0);
-			PPC_JMP(exit_addr);
+			tmp_idx = ctx->idx * 4;
 			PPC_BPF_LDARX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1], 0);
 			PPC_ADD(b2p[TMP_REG_2], b2p[TMP_REG_2], src_reg);
 			PPC_BPF_STDCX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1]);
-			PPC_BCC_SHORT(COND_EQ, (ctx->idx * 4) + (7*4));
-			PPC_BPF_LDARX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1], 0);
-			PPC_ADD(b2p[TMP_REG_2], b2p[TMP_REG_2], src_reg);
-			PPC_BPF_STDCX(b2p[TMP_REG_2], 0, b2p[TMP_REG_1]);
-			PPC_LI(b2p[BPF_REG_0], 0);
-			PPC_BCC(COND_NE, exit_addr);
+			PPC_BCC_SHORT(COND_NE, tmp_idx);
 			break;
 
 		/*
@@ -729,23 +738,15 @@ emit_clear:
 		case BPF_JMP | BPF_CALL:
 			ctx->seen |= SEEN_FUNC;
 
-			/* bpf function call */
-			if (insn[i].src_reg == BPF_PSEUDO_CALL)
-				if (!extra_pass)
-					func = NULL;
-				else if (fp->aux->func && off < fp->aux->func_cnt)
-					/* use the subprog id from the off
-					 * field to lookup the callee address
-					 */
-					func = (u8 *) fp->aux->func[off]->bpf_func;
-				else
-					return -EINVAL;
-			/* kernel helper call */
+			ret = bpf_jit_get_func_addr(fp, &insn[i], extra_pass,
+						    &func_addr, &func_addr_fixed);
+			if (ret < 0)
+				return ret;
+
+			if (func_addr_fixed)
+				bpf_jit_emit_func_call_hlp(image, ctx, func_addr);
 			else
-				func = (u8 *) __bpf_call_base + imm;
-
-			bpf_jit_emit_func_call(image, ctx, (u64)func);
-
+				bpf_jit_emit_func_call_rel(image, ctx, func_addr);
 			/* move return value from r3 to BPF_REG_0 */
 			PPC_MR(b2p[BPF_REG_0], 3);
 			break;

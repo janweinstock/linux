@@ -24,6 +24,7 @@
 #include <linux/list.h>
 #include <linux/slab.h>
 #include <nd-core.h>
+#include <intel.h>
 #include <nfit.h>
 #include <nd.h>
 #include "nfit_test.h"
@@ -139,8 +140,31 @@ static u32 handle[] = {
 	[6] = NFIT_DIMM_HANDLE(1, 0, 0, 0, 1),
 };
 
-static unsigned long dimm_fail_cmd_flags[NUM_DCR];
-static int dimm_fail_cmd_code[NUM_DCR];
+static unsigned long dimm_fail_cmd_flags[ARRAY_SIZE(handle)];
+static int dimm_fail_cmd_code[ARRAY_SIZE(handle)];
+
+static const struct nd_intel_smart smart_def = {
+	.flags = ND_INTEL_SMART_HEALTH_VALID
+		| ND_INTEL_SMART_SPARES_VALID
+		| ND_INTEL_SMART_ALARM_VALID
+		| ND_INTEL_SMART_USED_VALID
+		| ND_INTEL_SMART_SHUTDOWN_VALID
+		| ND_INTEL_SMART_SHUTDOWN_COUNT_VALID
+		| ND_INTEL_SMART_MTEMP_VALID
+		| ND_INTEL_SMART_CTEMP_VALID,
+	.health = ND_INTEL_SMART_NON_CRITICAL_HEALTH,
+	.media_temperature = 23 * 16,
+	.ctrl_temperature = 25 * 16,
+	.pmic_temperature = 40 * 16,
+	.spares = 75,
+	.alarm_flags = ND_INTEL_SMART_SPARE_TRIP
+		| ND_INTEL_SMART_TEMP_TRIP,
+	.ait_status = 1,
+	.life_used = 5,
+	.shutdown_state = 0,
+	.shutdown_count = 42,
+	.vendor_size = 0,
+};
 
 struct nfit_test_fw {
 	enum intel_fw_update_state state;
@@ -181,7 +205,7 @@ struct nfit_test {
 		unsigned long deadline;
 		spinlock_t lock;
 	} ars_state;
-	struct device *dimm_dev[NUM_DCR];
+	struct device *dimm_dev[ARRAY_SIZE(handle)];
 	struct nd_intel_smart *smart;
 	struct nd_intel_smart_threshold *smart_threshold;
 	struct badrange badrange;
@@ -752,15 +776,30 @@ static int nfit_test_cmd_smart_inject(
 	if (buf_len != sizeof(*inj))
 		return -EINVAL;
 
-	if (inj->mtemp_enable)
-		smart->media_temperature = inj->media_temperature;
-	if (inj->spare_enable)
-		smart->spares = inj->spares;
-	if (inj->fatal_enable)
-		smart->health = ND_INTEL_SMART_FATAL_HEALTH;
-	if (inj->unsafe_shutdown_enable) {
-		smart->shutdown_state = 1;
-		smart->shutdown_count++;
+	if (inj->flags & ND_INTEL_SMART_INJECT_MTEMP) {
+		if (inj->mtemp_enable)
+			smart->media_temperature = inj->media_temperature;
+		else
+			smart->media_temperature = smart_def.media_temperature;
+	}
+	if (inj->flags & ND_INTEL_SMART_INJECT_SPARE) {
+		if (inj->spare_enable)
+			smart->spares = inj->spares;
+		else
+			smart->spares = smart_def.spares;
+	}
+	if (inj->flags & ND_INTEL_SMART_INJECT_FATAL) {
+		if (inj->fatal_enable)
+			smart->health = ND_INTEL_SMART_FATAL_HEALTH;
+		else
+			smart->health = ND_INTEL_SMART_NON_CRITICAL_HEALTH;
+	}
+	if (inj->flags & ND_INTEL_SMART_INJECT_SHUTDOWN) {
+		if (inj->unsafe_shutdown_enable) {
+			smart->shutdown_state = 1;
+			smart->shutdown_count++;
+		} else
+			smart->shutdown_state = 0;
 	}
 	inj->status = 0;
 	smart_notify(bus_dev, dimm_dev, smart, thresh);
@@ -884,6 +923,16 @@ static int nd_intel_test_cmd_set_lss_status(struct nfit_test *t,
 	return 0;
 }
 
+static int override_return_code(int dimm, unsigned int func, int rc)
+{
+	if ((1 << func) & dimm_fail_cmd_flags[dimm]) {
+		if (dimm_fail_cmd_code[dimm])
+			return dimm_fail_cmd_code[dimm];
+		return -EIO;
+	}
+	return rc;
+}
+
 static int get_dimm(struct nfit_mem *nfit_mem, unsigned int func)
 {
 	int i;
@@ -894,13 +943,6 @@ static int get_dimm(struct nfit_mem *nfit_mem, unsigned int func)
 			break;
 	if (i >= ARRAY_SIZE(handle))
 		return -ENXIO;
-
-	if ((1 << func) & dimm_fail_cmd_flags[i]) {
-		if (dimm_fail_cmd_code[i])
-			return dimm_fail_cmd_code[i];
-		return -EIO;
-	}
-
 	return i;
 }
 
@@ -939,48 +981,59 @@ static int nfit_test_ctl(struct nvdimm_bus_descriptor *nd_desc,
 
 			switch (func) {
 			case ND_INTEL_ENABLE_LSS_STATUS:
-				return nd_intel_test_cmd_set_lss_status(t,
+				rc = nd_intel_test_cmd_set_lss_status(t,
 						buf, buf_len);
+				break;
 			case ND_INTEL_FW_GET_INFO:
-				return nd_intel_test_get_fw_info(t, buf,
+				rc = nd_intel_test_get_fw_info(t, buf,
 						buf_len, i - t->dcr_idx);
+				break;
 			case ND_INTEL_FW_START_UPDATE:
-				return nd_intel_test_start_update(t, buf,
+				rc = nd_intel_test_start_update(t, buf,
 						buf_len, i - t->dcr_idx);
+				break;
 			case ND_INTEL_FW_SEND_DATA:
-				return nd_intel_test_send_data(t, buf,
+				rc = nd_intel_test_send_data(t, buf,
 						buf_len, i - t->dcr_idx);
+				break;
 			case ND_INTEL_FW_FINISH_UPDATE:
-				return nd_intel_test_finish_fw(t, buf,
+				rc = nd_intel_test_finish_fw(t, buf,
 						buf_len, i - t->dcr_idx);
+				break;
 			case ND_INTEL_FW_FINISH_QUERY:
-				return nd_intel_test_finish_query(t, buf,
+				rc = nd_intel_test_finish_query(t, buf,
 						buf_len, i - t->dcr_idx);
+				break;
 			case ND_INTEL_SMART:
-				return nfit_test_cmd_smart(buf, buf_len,
+				rc = nfit_test_cmd_smart(buf, buf_len,
 						&t->smart[i - t->dcr_idx]);
+				break;
 			case ND_INTEL_SMART_THRESHOLD:
-				return nfit_test_cmd_smart_threshold(buf,
+				rc = nfit_test_cmd_smart_threshold(buf,
 						buf_len,
 						&t->smart_threshold[i -
 							t->dcr_idx]);
+				break;
 			case ND_INTEL_SMART_SET_THRESHOLD:
-				return nfit_test_cmd_smart_set_threshold(buf,
+				rc = nfit_test_cmd_smart_set_threshold(buf,
 						buf_len,
 						&t->smart_threshold[i -
 							t->dcr_idx],
 						&t->smart[i - t->dcr_idx],
 						&t->pdev.dev, t->dimm_dev[i]);
+				break;
 			case ND_INTEL_SMART_INJECT:
-				return nfit_test_cmd_smart_inject(buf,
+				rc = nfit_test_cmd_smart_inject(buf,
 						buf_len,
 						&t->smart_threshold[i -
 							t->dcr_idx],
 						&t->smart[i - t->dcr_idx],
 						&t->pdev.dev, t->dimm_dev[i]);
+				break;
 			default:
 				return -ENOTTY;
 			}
+			return override_return_code(i, func, rc);
 		}
 
 		if (!test_bit(cmd, &cmd_mask)
@@ -1006,6 +1059,7 @@ static int nfit_test_ctl(struct nvdimm_bus_descriptor *nd_desc,
 		default:
 			return -ENOTTY;
 		}
+		return override_return_code(i, func, rc);
 	} else {
 		struct ars_state *ars_state = &t->ars_state;
 		struct nd_cmd_pkg *call_pkg = buf;
@@ -1302,29 +1356,9 @@ static void smart_init(struct nfit_test *t)
 		.ctrl_temperature = 30 * 16,
 		.spares = 5,
 	};
-	const struct nd_intel_smart smart_data = {
-		.flags = ND_INTEL_SMART_HEALTH_VALID
-			| ND_INTEL_SMART_SPARES_VALID
-			| ND_INTEL_SMART_ALARM_VALID
-			| ND_INTEL_SMART_USED_VALID
-			| ND_INTEL_SMART_SHUTDOWN_VALID
-			| ND_INTEL_SMART_MTEMP_VALID,
-		.health = ND_INTEL_SMART_NON_CRITICAL_HEALTH,
-		.media_temperature = 23 * 16,
-		.ctrl_temperature = 25 * 16,
-		.pmic_temperature = 40 * 16,
-		.spares = 75,
-		.alarm_flags = ND_INTEL_SMART_SPARE_TRIP
-			| ND_INTEL_SMART_TEMP_TRIP,
-		.ait_status = 1,
-		.life_used = 5,
-		.shutdown_state = 0,
-		.vendor_size = 0,
-		.shutdown_count = 100,
-	};
 
 	for (i = 0; i < t->num_dcr; i++) {
-		memcpy(&t->smart[i], &smart_data, sizeof(smart_data));
+		memcpy(&t->smart[i], &smart_def, sizeof(smart_def));
 		memcpy(&t->smart_threshold[i], &smart_t_data,
 				sizeof(smart_t_data));
 	}
@@ -1991,8 +2025,7 @@ static void nfit_test0_setup(struct nfit_test *t)
 	pcap->header.type = ACPI_NFIT_TYPE_CAPABILITIES;
 	pcap->header.length = sizeof(*pcap);
 	pcap->highest_capability = 1;
-	pcap->capabilities = ACPI_NFIT_CAPABILITY_CACHE_FLUSH |
-		ACPI_NFIT_CAPABILITY_MEM_FLUSH;
+	pcap->capabilities = ACPI_NFIT_CAPABILITY_MEM_FLUSH;
 	offset += pcap->header.length;
 
 	if (t->setup_hotplug) {
@@ -2647,7 +2680,7 @@ static int nfit_test_probe(struct platform_device *pdev)
 		u32 nfit_handle = __to_nfit_memdev(nfit_mem)->device_handle;
 		int i;
 
-		for (i = 0; i < NUM_DCR; i++)
+		for (i = 0; i < ARRAY_SIZE(handle); i++)
 			if (nfit_handle == handle[i])
 				dev_set_drvdata(nfit_test->dimm_dev[i],
 						nfit_mem);

@@ -7,10 +7,9 @@ config SUPERH
 	select ARCH_NO_COHERENT_DMA_MMAP if !MMU
 	select HAVE_PATA_PLATFORM
 	select CLKDEV_LOOKUP
+	select DMA_DIRECT_OPS
 	select HAVE_IDE if HAS_IOPORT_MAP
-	select HAVE_MEMBLOCK
 	select HAVE_MEMBLOCK_NODE_MAP
-	select NO_BOOTMEM
 	select ARCH_DISCARD_MEMBLOCK
 	select HAVE_OPROFILE
 	select HAVE_GENERIC_DMA_COHERENT
@@ -51,7 +50,6 @@ config SUPERH
 	select HAVE_ARCH_AUDITSYSCALL
 	select HAVE_FUTEX_CMPXCHG if FUTEX
 	select HAVE_NMI
-	select NEED_DMA_MAP_STATE
 	select NEED_SG_DMA_LENGTH
 
 	help
@@ -163,14 +161,11 @@ config DMA_COHERENT
 
 config DMA_NONCOHERENT
 	def_bool !DMA_COHERENT
+	select ARCH_HAS_SYNC_DMA_FOR_DEVICE
 
 config PGTABLE_LEVELS
 	default 3 if X2TLB
 	default 2
-
-source "init/Kconfig"
-
-source "kernel/Kconfig.freezer"
 
 menu "System type"
 
@@ -713,8 +708,6 @@ config HOTPLUG_CPU
 	  Say Y here to experiment with turning CPUs off and on.  CPUs
 	  can be controlled through /sys/devices/system/cpu.
 
-source "kernel/Kconfig.preempt"
-
 config GUSA
 	def_bool y
 	depends on !SMP && SUPERH32
@@ -882,12 +875,6 @@ source "drivers/pcmcia/Kconfig"
 
 endmenu
 
-menu "Executable file formats"
-
-source "fs/Kconfig.binfmt"
-
-endmenu
-
 menu "Power management options (EXPERIMENTAL)"
 
 source "kernel/power/Kconfig"
@@ -895,17 +882,3 @@ source "kernel/power/Kconfig"
 source "drivers/cpuidle/Kconfig"
 
 endmenu
-
-source "net/Kconfig"
-
-source "drivers/Kconfig"
-
-source "fs/Kconfig"
-
-source "arch/sh/Kconfig.debug"
-
-source "security/Kconfig"
-
-source "crypto/Kconfig"
-
-source "lib/Kconfig"

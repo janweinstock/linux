@@ -2855,12 +2855,12 @@ static int qedf_set_fcoe_pf_param(struct qedf_ctx *qedf)
 	QEDF_INFO(&(qedf->dbg_ctx), QEDF_LOG_DISC, "Number of CQs is %d.\n",
 		   qedf->num_queues);
 
-	qedf->p_cpuq = pci_alloc_consistent(qedf->pdev,
+	qedf->p_cpuq = dma_alloc_coherent(&qedf->pdev->dev,
 	    qedf->num_queues * sizeof(struct qedf_glbl_q_params),
-	    &qedf->hw_p_cpuq);
+	    &qedf->hw_p_cpuq, GFP_KERNEL);
 
 	if (!qedf->p_cpuq) {
-		QEDF_ERR(&(qedf->dbg_ctx), "pci_alloc_consistent failed.\n");
+		QEDF_ERR(&(qedf->dbg_ctx), "dma_alloc_coherent failed.\n");
 		return 1;
 	}
 
@@ -2929,7 +2929,7 @@ static void qedf_free_fcoe_pf_param(struct qedf_ctx *qedf)
 
 	if (qedf->p_cpuq) {
 		size = qedf->num_queues * sizeof(struct qedf_glbl_q_params);
-		pci_free_consistent(qedf->pdev, size, qedf->p_cpuq,
+		dma_free_coherent(&qedf->pdev->dev, size, qedf->p_cpuq,
 		    qedf->hw_p_cpuq);
 	}
 
@@ -3295,6 +3295,11 @@ static int __qedf_probe(struct pci_dev *pdev, int mode)
 
 	init_completion(&qedf->flogi_compl);
 
+	status = qed_ops->common->update_drv_state(qedf->cdev, true);
+	if (status)
+		QEDF_ERR(&(qedf->dbg_ctx),
+			"Failed to send drv state to MFW.\n");
+
 	memset(&link_params, 0, sizeof(struct qed_link_params));
 	link_params.link_up = true;
 	status = qed_ops->common->set_link(qedf->cdev, &link_params);
@@ -3343,6 +3348,7 @@ static int qedf_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 static void __qedf_remove(struct pci_dev *pdev, int mode)
 {
 	struct qedf_ctx *qedf;
+	int rc;
 
 	if (!pdev) {
 		QEDF_ERR(NULL, "pdev is NULL.\n");
@@ -3437,6 +3443,12 @@ static void __qedf_remove(struct pci_dev *pdev, int mode)
 		qed_ops->common->set_power_state(qedf->cdev, PCI_D0);
 		pci_set_drvdata(pdev, NULL);
 	}
+
+	rc = qed_ops->common->update_drv_state(qedf->cdev, false);
+	if (rc)
+		QEDF_ERR(&(qedf->dbg_ctx),
+			"Failed to send drv state to MFW.\n");
+
 	qed_ops->common->slowpath_stop(qedf->cdev);
 	qed_ops->common->remove(qedf->cdev);
 

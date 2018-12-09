@@ -485,9 +485,7 @@ static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
 	size_t tsize;
 
 	if (is_llc_occupancy_enabled()) {
-		d->rmid_busy_llc = kcalloc(BITS_TO_LONGS(r->num_rmid),
-					   sizeof(unsigned long),
-					   GFP_KERNEL);
+		d->rmid_busy_llc = bitmap_zalloc(r->num_rmid, GFP_KERNEL);
 		if (!d->rmid_busy_llc)
 			return -ENOMEM;
 		INIT_DELAYED_WORK(&d->cqm_limbo, cqm_handle_limbo);
@@ -496,7 +494,7 @@ static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
 		tsize = sizeof(*d->mbm_total);
 		d->mbm_total = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
 		if (!d->mbm_total) {
-			kfree(d->rmid_busy_llc);
+			bitmap_free(d->rmid_busy_llc);
 			return -ENOMEM;
 		}
 	}
@@ -504,7 +502,7 @@ static int domain_setup_mon_state(struct rdt_resource *r, struct rdt_domain *d)
 		tsize = sizeof(*d->mbm_local);
 		d->mbm_local = kcalloc(r->num_rmid, tsize, GFP_KERNEL);
 		if (!d->mbm_local) {
-			kfree(d->rmid_busy_llc);
+			bitmap_free(d->rmid_busy_llc);
 			kfree(d->mbm_total);
 			return -ENOMEM;
 		}
@@ -610,9 +608,16 @@ static void domain_remove_cpu(int cpu, struct rdt_resource *r)
 			cancel_delayed_work(&d->cqm_limbo);
 		}
 
+		/*
+		 * rdt_domain "d" is going to be freed below, so clear
+		 * its pointer from pseudo_lock_region struct.
+		 */
+		if (d->plr)
+			d->plr->d = NULL;
+
 		kfree(d->ctrl_val);
 		kfree(d->mbps_val);
-		kfree(d->rmid_busy_llc);
+		bitmap_free(d->rmid_busy_llc);
 		kfree(d->mbm_total);
 		kfree(d->mbm_local);
 		kfree(d);
@@ -859,6 +864,8 @@ static __init bool get_rdt_resources(void)
 	return (rdt_mon_capable || rdt_alloc_capable);
 }
 
+static enum cpuhp_state rdt_online;
+
 static int __init intel_rdt_late_init(void)
 {
 	struct rdt_resource *r;
@@ -880,6 +887,7 @@ static int __init intel_rdt_late_init(void)
 		cpuhp_remove_state(state);
 		return ret;
 	}
+	rdt_online = state;
 
 	for_each_alloc_capable_rdt_resource(r)
 		pr_info("Intel RDT %s allocation detected\n", r->name);
@@ -891,3 +899,11 @@ static int __init intel_rdt_late_init(void)
 }
 
 late_initcall(intel_rdt_late_init);
+
+static void __exit intel_rdt_exit(void)
+{
+	cpuhp_remove_state(rdt_online);
+	rdtgroup_exit();
+}
+
+__exitcall(intel_rdt_exit);

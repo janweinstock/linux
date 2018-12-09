@@ -109,11 +109,8 @@ static int pp_sw_fini(void *handle)
 
 	hwmgr_sw_fini(hwmgr);
 
-	if (adev->firmware.load_type == AMDGPU_FW_LOAD_SMU) {
-		release_firmware(adev->pm.fw);
-		adev->pm.fw = NULL;
-		amdgpu_ucode_fini_bo(adev);
-	}
+	release_firmware(adev->pm.fw);
+	adev->pm.fw = NULL;
 
 	return 0;
 }
@@ -123,9 +120,6 @@ static int pp_hw_init(void *handle)
 	int ret = 0;
 	struct amdgpu_device *adev = handle;
 	struct pp_hwmgr *hwmgr = adev->powerplay.pp_handle;
-
-	if (adev->firmware.load_type == AMDGPU_FW_LOAD_SMU)
-		amdgpu_ucode_init_bo(adev);
 
 	ret = hwmgr_hw_init(hwmgr);
 
@@ -221,29 +215,7 @@ static int pp_sw_reset(void *handle)
 static int pp_set_powergating_state(void *handle,
 				    enum amd_powergating_state state)
 {
-	struct amdgpu_device *adev = handle;
-	struct pp_hwmgr *hwmgr = adev->powerplay.pp_handle;
-	int ret;
-
-	if (!hwmgr || !hwmgr->pm_en)
-		return 0;
-
-	if (hwmgr->hwmgr_func->gfx_off_control) {
-		/* Enable/disable GFX off through SMU */
-		ret = hwmgr->hwmgr_func->gfx_off_control(hwmgr,
-							 state == AMD_PG_STATE_GATE);
-		if (ret)
-			pr_err("gfx off control failed!\n");
-	}
-
-	if (hwmgr->hwmgr_func->enable_per_cu_power_gating == NULL) {
-		pr_debug("%s was not implemented.\n", __func__);
-		return 0;
-	}
-
-	/* Enable/disable GFX per cu powergating through SMU */
-	return hwmgr->hwmgr_func->enable_per_cu_power_gating(hwmgr,
-			state == AMD_PG_STATE_GATE);
+	return 0;
 }
 
 static int pp_suspend(void *handle)
@@ -295,8 +267,23 @@ const struct amdgpu_ip_block_version pp_smu_ip_block =
 	.funcs = &pp_ip_funcs,
 };
 
+/* This interface only be supported On Vi,
+ * because only smu7/8 can help to load gfx/sdma fw,
+ * smu need to be enabled before load other ip's fw.
+ * so call start smu to load smu7 fw and other ip's fw
+ */
 static int pp_dpm_load_fw(void *handle)
 {
+	struct pp_hwmgr *hwmgr = handle;
+
+	if (!hwmgr || !hwmgr->smumgr_funcs || !hwmgr->smumgr_funcs->start_smu)
+		return -EINVAL;
+
+	if (hwmgr->smumgr_funcs->start_smu(hwmgr)) {
+		pr_err("fw load failed\n");
+		return -EINVAL;
+	}
+
 	return 0;
 }
 
@@ -598,6 +585,24 @@ static int pp_dpm_get_fan_speed_rpm(void *handle, uint32_t *rpm)
 	return ret;
 }
 
+static int pp_dpm_set_fan_speed_rpm(void *handle, uint32_t rpm)
+{
+	struct pp_hwmgr *hwmgr = handle;
+	int ret = 0;
+
+	if (!hwmgr || !hwmgr->pm_en)
+		return -EINVAL;
+
+	if (hwmgr->hwmgr_func->set_fan_speed_rpm == NULL) {
+		pr_info("%s was not implemented.\n", __func__);
+		return 0;
+	}
+	mutex_lock(&hwmgr->smu_lock);
+	ret = hwmgr->hwmgr_func->set_fan_speed_rpm(hwmgr, rpm);
+	mutex_unlock(&hwmgr->smu_lock);
+	return ret;
+}
+
 static int pp_dpm_get_pp_num_states(void *handle,
 		struct pp_states_info *data)
 {
@@ -718,11 +723,14 @@ static int pp_dpm_force_clock_level(void *handle,
 		pr_info("%s was not implemented.\n", __func__);
 		return 0;
 	}
+
+	if (hwmgr->dpm_level != AMD_DPM_FORCED_LEVEL_MANUAL) {
+		pr_info("force clock level is for dpm manual mode only.\n");
+		return -EINVAL;
+	}
+
 	mutex_lock(&hwmgr->smu_lock);
-	if (hwmgr->dpm_level == AMD_DPM_FORCED_LEVEL_MANUAL)
-		ret = hwmgr->hwmgr_func->force_clock_level(hwmgr, type, mask);
-	else
-		ret = -EINVAL;
+	ret = hwmgr->hwmgr_func->force_clock_level(hwmgr, type, mask);
 	mutex_unlock(&hwmgr->smu_lock);
 	return ret;
 }
@@ -835,6 +843,12 @@ static int pp_dpm_read_sensor(void *handle, int idx,
 	case AMDGPU_PP_SENSOR_STABLE_PSTATE_MCLK:
 		*((uint32_t *)value) = hwmgr->pstate_mclk;
 		return 0;
+	case AMDGPU_PP_SENSOR_MIN_FAN_RPM:
+		*((uint32_t *)value) = hwmgr->thermal_controller.fanInfo.ulMinRPM;
+		return 0;
+	case AMDGPU_PP_SENSOR_MAX_FAN_RPM:
+		*((uint32_t *)value) = hwmgr->thermal_controller.fanInfo.ulMaxRPM;
+		return 0;
 	default:
 		mutex_lock(&hwmgr->smu_lock);
 		ret = hwmgr->hwmgr_func->read_sensor(hwmgr, idx, value, size);
@@ -883,9 +897,14 @@ static int pp_set_power_profile_mode(void *handle, long *input, uint32_t size)
 		pr_info("%s was not implemented.\n", __func__);
 		return ret;
 	}
+
+	if (hwmgr->dpm_level != AMD_DPM_FORCED_LEVEL_MANUAL) {
+		pr_info("power profile setting is for manual dpm mode only.\n");
+		return ret;
+	}
+
 	mutex_lock(&hwmgr->smu_lock);
-	if (hwmgr->dpm_level == AMD_DPM_FORCED_LEVEL_MANUAL)
-		ret = hwmgr->hwmgr_func->set_power_profile_mode(hwmgr, input, size);
+	ret = hwmgr->hwmgr_func->set_power_profile_mode(hwmgr, input, size);
 	mutex_unlock(&hwmgr->smu_lock);
 	return ret;
 }
@@ -947,6 +966,7 @@ static int pp_dpm_switch_power_profile(void *handle,
 static int pp_set_power_limit(void *handle, uint32_t limit)
 {
 	struct pp_hwmgr *hwmgr = handle;
+	uint32_t max_power_limit;
 
 	if (!hwmgr || !hwmgr->pm_en)
 		return -EINVAL;
@@ -959,7 +979,13 @@ static int pp_set_power_limit(void *handle, uint32_t limit)
 	if (limit == 0)
 		limit = hwmgr->default_power_limit;
 
-	if (limit > hwmgr->default_power_limit)
+	max_power_limit = hwmgr->default_power_limit;
+	if (hwmgr->od_enabled) {
+		max_power_limit *= (100 + hwmgr->platform_descriptor.TDPODLimit);
+		max_power_limit /= 100;
+	}
+
+	if (limit > max_power_limit)
 		return -EINVAL;
 
 	mutex_lock(&hwmgr->smu_lock);
@@ -978,8 +1004,13 @@ static int pp_get_power_limit(void *handle, uint32_t *limit, bool default_limit)
 
 	mutex_lock(&hwmgr->smu_lock);
 
-	if (default_limit)
+	if (default_limit) {
 		*limit = hwmgr->default_power_limit;
+		if (hwmgr->od_enabled) {
+			*limit *= (100 + hwmgr->platform_descriptor.TDPODLimit);
+			*limit /= 100;
+		}
+	}
 	else
 		*limit = hwmgr->power_limit;
 
@@ -1020,7 +1051,7 @@ static int pp_get_display_power_level(void *handle,
 static int pp_get_current_clocks(void *handle,
 		struct amd_pp_clock_info *clocks)
 {
-	struct amd_pp_simple_clock_info simple_clocks;
+	struct amd_pp_simple_clock_info simple_clocks = { 0 };
 	struct pp_clock_info hw_clocks;
 	struct pp_hwmgr *hwmgr = handle;
 	int ret = 0;
@@ -1056,7 +1087,10 @@ static int pp_get_current_clocks(void *handle,
 	clocks->max_engine_clock_in_sr = hw_clocks.max_eng_clk;
 	clocks->min_engine_clock_in_sr = hw_clocks.min_eng_clk;
 
-	clocks->max_clocks_state = simple_clocks.level;
+	if (simple_clocks.level == 0)
+		clocks->max_clocks_state = PP_DAL_POWERLEVEL_7;
+	else
+		clocks->max_clocks_state = simple_clocks.level;
 
 	if (0 == phm_get_current_shallow_sleep_clocks(hwmgr, &hwmgr->current_ps->hardware, &hw_clocks)) {
 		clocks->max_engine_clock_in_sr = hw_clocks.max_eng_clk;
@@ -1118,17 +1152,17 @@ static int pp_get_clock_by_type_with_voltage(void *handle,
 }
 
 static int pp_set_watermarks_for_clocks_ranges(void *handle,
-		struct pp_wm_sets_with_clock_ranges_soc15 *wm_with_clock_ranges)
+		void *clock_ranges)
 {
 	struct pp_hwmgr *hwmgr = handle;
 	int ret = 0;
 
-	if (!hwmgr || !hwmgr->pm_en ||!wm_with_clock_ranges)
+	if (!hwmgr || !hwmgr->pm_en || !clock_ranges)
 		return -EINVAL;
 
 	mutex_lock(&hwmgr->smu_lock);
 	ret = phm_set_watermarks_for_clocks_ranges(hwmgr,
-			wm_with_clock_ranges);
+			clock_ranges);
 	mutex_unlock(&hwmgr->smu_lock);
 
 	return ret;
@@ -1159,6 +1193,8 @@ static int pp_get_display_mode_validation_clocks(void *handle,
 	if (!hwmgr || !hwmgr->pm_en ||!clocks)
 		return -EINVAL;
 
+	clocks->level = PP_DAL_POWERLEVEL_7;
+
 	mutex_lock(&hwmgr->smu_lock);
 
 	if (phm_cap_enabled(hwmgr->platform_descriptor.platformCaps, PHM_PlatformCaps_DynamicPatchPowerState))
@@ -1168,19 +1204,132 @@ static int pp_get_display_mode_validation_clocks(void *handle,
 	return ret;
 }
 
-static int pp_set_mmhub_powergating_by_smu(void *handle)
+static int pp_dpm_powergate_mmhub(void *handle)
 {
 	struct pp_hwmgr *hwmgr = handle;
 
 	if (!hwmgr || !hwmgr->pm_en)
 		return -EINVAL;
 
-	if (hwmgr->hwmgr_func->set_mmhub_powergating_by_smu == NULL) {
+	if (hwmgr->hwmgr_func->powergate_mmhub == NULL) {
 		pr_info("%s was not implemented.\n", __func__);
 		return 0;
 	}
 
-	return hwmgr->hwmgr_func->set_mmhub_powergating_by_smu(hwmgr);
+	return hwmgr->hwmgr_func->powergate_mmhub(hwmgr);
+}
+
+static int pp_dpm_powergate_gfx(void *handle, bool gate)
+{
+	struct pp_hwmgr *hwmgr = handle;
+
+	if (!hwmgr || !hwmgr->pm_en)
+		return 0;
+
+	if (hwmgr->hwmgr_func->powergate_gfx == NULL) {
+		pr_info("%s was not implemented.\n", __func__);
+		return 0;
+	}
+
+	return hwmgr->hwmgr_func->powergate_gfx(hwmgr, gate);
+}
+
+static void pp_dpm_powergate_acp(void *handle, bool gate)
+{
+	struct pp_hwmgr *hwmgr = handle;
+
+	if (!hwmgr || !hwmgr->pm_en)
+		return;
+
+	if (hwmgr->hwmgr_func->powergate_acp == NULL) {
+		pr_info("%s was not implemented.\n", __func__);
+		return;
+	}
+
+	hwmgr->hwmgr_func->powergate_acp(hwmgr, gate);
+}
+
+static void pp_dpm_powergate_sdma(void *handle, bool gate)
+{
+	struct pp_hwmgr *hwmgr = handle;
+
+	if (!hwmgr)
+		return;
+
+	if (hwmgr->hwmgr_func->powergate_sdma == NULL) {
+		pr_info("%s was not implemented.\n", __func__);
+		return;
+	}
+
+	hwmgr->hwmgr_func->powergate_sdma(hwmgr, gate);
+}
+
+static int pp_set_powergating_by_smu(void *handle,
+				uint32_t block_type, bool gate)
+{
+	int ret = 0;
+
+	switch (block_type) {
+	case AMD_IP_BLOCK_TYPE_UVD:
+	case AMD_IP_BLOCK_TYPE_VCN:
+		pp_dpm_powergate_uvd(handle, gate);
+		break;
+	case AMD_IP_BLOCK_TYPE_VCE:
+		pp_dpm_powergate_vce(handle, gate);
+		break;
+	case AMD_IP_BLOCK_TYPE_GMC:
+		pp_dpm_powergate_mmhub(handle);
+		break;
+	case AMD_IP_BLOCK_TYPE_GFX:
+		ret = pp_dpm_powergate_gfx(handle, gate);
+		break;
+	case AMD_IP_BLOCK_TYPE_ACP:
+		pp_dpm_powergate_acp(handle, gate);
+		break;
+	case AMD_IP_BLOCK_TYPE_SDMA:
+		pp_dpm_powergate_sdma(handle, gate);
+		break;
+	default:
+		break;
+	}
+	return ret;
+}
+
+static int pp_notify_smu_enable_pwe(void *handle)
+{
+	struct pp_hwmgr *hwmgr = handle;
+
+	if (!hwmgr || !hwmgr->pm_en)
+		return -EINVAL;
+
+	if (hwmgr->hwmgr_func->smus_notify_pwe == NULL) {
+		pr_info("%s was not implemented.\n", __func__);
+		return -EINVAL;;
+	}
+
+	mutex_lock(&hwmgr->smu_lock);
+	hwmgr->hwmgr_func->smus_notify_pwe(hwmgr);
+	mutex_unlock(&hwmgr->smu_lock);
+
+	return 0;
+}
+
+static int pp_enable_mgpu_fan_boost(void *handle)
+{
+	struct pp_hwmgr *hwmgr = handle;
+
+	if (!hwmgr)
+		return -EINVAL;
+
+	if (!hwmgr->pm_en ||
+	     hwmgr->hwmgr_func->enable_mgpu_fan_boost == NULL)
+		return 0;
+
+	mutex_lock(&hwmgr->smu_lock);
+	hwmgr->hwmgr_func->enable_mgpu_fan_boost(hwmgr);
+	mutex_unlock(&hwmgr->smu_lock);
+
+	return 0;
 }
 
 static const struct amd_pm_funcs pp_dpm_funcs = {
@@ -1189,14 +1338,13 @@ static const struct amd_pm_funcs pp_dpm_funcs = {
 	.force_performance_level = pp_dpm_force_performance_level,
 	.get_performance_level = pp_dpm_get_performance_level,
 	.get_current_power_state = pp_dpm_get_current_power_state,
-	.powergate_vce = pp_dpm_powergate_vce,
-	.powergate_uvd = pp_dpm_powergate_uvd,
 	.dispatch_tasks = pp_dpm_dispatch_tasks,
 	.set_fan_control_mode = pp_dpm_set_fan_control_mode,
 	.get_fan_control_mode = pp_dpm_get_fan_control_mode,
 	.set_fan_speed_percent = pp_dpm_set_fan_speed_percent,
 	.get_fan_speed_percent = pp_dpm_get_fan_speed_percent,
 	.get_fan_speed_rpm = pp_dpm_get_fan_speed_rpm,
+	.set_fan_speed_rpm = pp_dpm_set_fan_speed_rpm,
 	.get_pp_num_states = pp_dpm_get_pp_num_states,
 	.get_pp_table = pp_dpm_get_pp_table,
 	.set_pp_table = pp_dpm_set_pp_table,
@@ -1210,6 +1358,7 @@ static const struct amd_pm_funcs pp_dpm_funcs = {
 	.get_vce_clock_state = pp_dpm_get_vce_clock_state,
 	.switch_power_profile = pp_dpm_switch_power_profile,
 	.set_clockgating_by_smu = pp_set_clockgating_by_smu,
+	.set_powergating_by_smu = pp_set_powergating_by_smu,
 	.get_power_profile_mode = pp_get_power_profile_mode,
 	.set_power_profile_mode = pp_set_power_profile_mode,
 	.odn_edit_dpm_table = pp_odn_edit_dpm_table,
@@ -1227,5 +1376,6 @@ static const struct amd_pm_funcs pp_dpm_funcs = {
 	.set_watermarks_for_clocks_ranges = pp_set_watermarks_for_clocks_ranges,
 	.display_clock_voltage_request = pp_display_clock_voltage_request,
 	.get_display_mode_validation_clocks = pp_get_display_mode_validation_clocks,
-	.set_mmhub_powergating_by_smu = pp_set_mmhub_powergating_by_smu,
+	.notify_smu_enable_pwe = pp_notify_smu_enable_pwe,
+	.enable_mgpu_fan_boost = pp_enable_mgpu_fan_boost,
 };

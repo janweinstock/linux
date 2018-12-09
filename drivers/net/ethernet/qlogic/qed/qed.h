@@ -336,6 +336,10 @@ struct qed_hw_info {
 	 */
 	u8 num_active_tc;
 	u8				offload_tc;
+	bool				offload_tc_set;
+
+	bool				multi_tc_roce_en;
+#define IS_QED_MULTI_TC_ROCE(p_hwfn) (((p_hwfn)->hw_info.multi_tc_roce_en))
 
 	u32				concrete_fid;
 	u16				opaque_fid;
@@ -399,8 +403,8 @@ struct qed_qm_info {
 	u16				start_pq;
 	u8				start_vport;
 	u16				 pure_lb_pq;
-	u16				offload_pq;
-	u16				low_latency_pq;
+	u16				first_ofld_pq;
+	u16				first_llt_pq;
 	u16				pure_ack_pq;
 	u16				ooo_pq;
 	u16				first_vf_pq;
@@ -502,6 +506,7 @@ enum BAR_ID {
 struct qed_nvm_image_info {
 	u32 num_images;
 	struct bist_nvm_image_att *image_att;
+	bool valid;
 };
 
 #define DRV_MODULE_VERSION		      \
@@ -618,6 +623,7 @@ struct qed_hwfn {
 	void				*unzip_buf;
 
 	struct dbg_tools_data		dbg_info;
+	void				*dbg_user_info;
 
 	/* PWM region specific data */
 	u16				wid_count;
@@ -880,11 +886,14 @@ void qed_set_fw_mac_addr(__le16 *fw_msb,
 #define PQ_FLAGS_OFLD   (BIT(5))
 #define PQ_FLAGS_VFS    (BIT(6))
 #define PQ_FLAGS_LLT    (BIT(7))
+#define PQ_FLAGS_MTC    (BIT(8))
 
 /* physical queue index for cm context intialization */
 u16 qed_get_cm_pq_idx(struct qed_hwfn *p_hwfn, u32 pq_flags);
 u16 qed_get_cm_pq_idx_mcos(struct qed_hwfn *p_hwfn, u8 tc);
 u16 qed_get_cm_pq_idx_vf(struct qed_hwfn *p_hwfn, u16 vf);
+u16 qed_get_cm_pq_idx_ofld_mtc(struct qed_hwfn *p_hwfn, u8 tc);
+u16 qed_get_cm_pq_idx_llt_mtc(struct qed_hwfn *p_hwfn, u8 tc);
 
 #define QED_LEADING_HWFN(dev)   (&dev->hwfns[0])
 
@@ -906,7 +915,7 @@ u16 qed_get_cm_pq_idx_vf(struct qed_hwfn *p_hwfn, u16 vf);
 /* Prototypes */
 int qed_fill_dev_info(struct qed_dev *cdev,
 		      struct qed_dev_info *dev_info);
-void qed_link_update(struct qed_hwfn *hwfn);
+void qed_link_update(struct qed_hwfn *hwfn, struct qed_ptt *ptt);
 u32 qed_unzip_data(struct qed_hwfn *p_hwfn,
 		   u32 input_len, u8 *input_buf,
 		   u32 max_size, u8 *unzip_buf);
@@ -920,4 +929,6 @@ int qed_mfw_tlv_req(struct qed_hwfn *hwfn);
 int qed_mfw_fill_tlv_data(struct qed_hwfn *hwfn,
 			  enum qed_mfw_tlv_type type,
 			  union qed_mfw_tlv_data *tlv_data);
+
+void qed_hw_info_set_offload_tc(struct qed_hw_info *p_info, u8 tc);
 #endif /* _QED_H */

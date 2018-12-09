@@ -202,7 +202,7 @@ static void v4l2_device_release(struct device *cd)
 	mutex_unlock(&videodev_lock);
 
 #if defined(CONFIG_MEDIA_CONTROLLER)
-	if (v4l2_dev->mdev) {
+	if (v4l2_dev->mdev && vdev->vfl_dir != VFL_DIR_M2M) {
 		/* Remove interfaces and interface links */
 		media_devnode_remove(vdev->intf_devnode);
 		if (vdev->entity.function != MEDIA_ENT_F_UNKNOWN)
@@ -444,8 +444,22 @@ static int v4l2_release(struct inode *inode, struct file *filp)
 	struct video_device *vdev = video_devdata(filp);
 	int ret = 0;
 
-	if (vdev->fops->release)
-		ret = vdev->fops->release(filp);
+	/*
+	 * We need to serialize the release() with queueing new requests.
+	 * The release() may trigger the cancellation of a streaming
+	 * operation, and that should not be mixed with queueing a new
+	 * request at the same time.
+	 */
+	if (vdev->fops->release) {
+		if (v4l2_device_supports_requests(vdev->v4l2_dev)) {
+			mutex_lock(&vdev->v4l2_dev->mdev->req_queue_mutex);
+			ret = vdev->fops->release(filp);
+			mutex_unlock(&vdev->v4l2_dev->mdev->req_queue_mutex);
+		} else {
+			ret = vdev->fops->release(filp);
+		}
+	}
+
 	if (vdev->dev_debug & V4L2_DEV_DEBUG_FOP)
 		dprintk("%s: release\n",
 			video_device_node_name(vdev));
@@ -733,19 +747,22 @@ static void determine_valid_ioctls(struct video_device *vdev)
 			BASE_VIDIOC_PRIVATE);
 }
 
-static int video_register_media_controller(struct video_device *vdev, int type)
+static int video_register_media_controller(struct video_device *vdev)
 {
 #if defined(CONFIG_MEDIA_CONTROLLER)
 	u32 intf_type;
 	int ret;
 
-	if (!vdev->v4l2_dev->mdev)
+	/* Memory-to-memory devices are more complex and use
+	 * their own function to register its mc entities.
+	 */
+	if (!vdev->v4l2_dev->mdev || vdev->vfl_dir == VFL_DIR_M2M)
 		return 0;
 
 	vdev->entity.obj_type = MEDIA_ENTITY_TYPE_VIDEO_DEVICE;
 	vdev->entity.function = MEDIA_ENT_F_UNKNOWN;
 
-	switch (type) {
+	switch (vdev->vfl_type) {
 	case VFL_TYPE_GRABBER:
 		intf_type = MEDIA_INTF_T_V4L_VIDEO;
 		vdev->entity.function = MEDIA_ENT_F_IO_V4L;
@@ -808,7 +825,8 @@ static int video_register_media_controller(struct video_device *vdev, int type)
 
 		link = media_create_intf_link(&vdev->entity,
 					      &vdev->intf_devnode->intf,
-					      MEDIA_LNK_FL_ENABLED);
+					      MEDIA_LNK_FL_ENABLED |
+					      MEDIA_LNK_FL_IMMUTABLE);
 		if (!link) {
 			media_devnode_remove(vdev->intf_devnode);
 			media_device_unregister_entity(&vdev->entity);
@@ -993,7 +1011,7 @@ int __video_register_device(struct video_device *vdev,
 	v4l2_device_get(vdev->v4l2_dev);
 
 	/* Part 5: Register the entity. */
-	ret = video_register_media_controller(vdev, type);
+	ret = video_register_media_controller(vdev);
 
 	/* Part 6: Activate this minor. The char device can now be used. */
 	set_bit(V4L2_FL_REGISTERED, &vdev->flags);

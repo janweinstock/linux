@@ -63,6 +63,7 @@ struct spi_imx_devtype_data {
 	void (*trigger)(struct spi_imx_data *);
 	int (*rx_available)(struct spi_imx_data *);
 	void (*reset)(struct spi_imx_data *);
+	void (*setup_wml)(struct spi_imx_data *);
 	void (*disable)(struct spi_imx_data *);
 	bool has_dmamode;
 	bool has_slavemode;
@@ -94,8 +95,7 @@ struct spi_imx_data {
 	void *rx_buf;
 	const void *tx_buf;
 	unsigned int txfifo; /* number of words pushed in tx FIFO */
-	unsigned int dynamic_burst, read_u32;
-	unsigned int word_mask;
+	unsigned int dynamic_burst;
 
 	/* Slave mode */
 	bool slave_mode;
@@ -140,6 +140,8 @@ static void spi_imx_buf_rx_##type(struct spi_imx_data *spi_imx)		\
 		*(type *)spi_imx->rx_buf = val;				\
 		spi_imx->rx_buf += sizeof(type);			\
 	}								\
+									\
+	spi_imx->remainder -= sizeof(type);				\
 }
 
 #define MXC_SPI_BUF_TX(type)						\
@@ -203,14 +205,18 @@ out:
 
 static int spi_imx_bytes_per_word(const int bits_per_word)
 {
-	return DIV_ROUND_UP(bits_per_word, BITS_PER_BYTE);
+	if (bits_per_word <= 8)
+		return 1;
+	else if (bits_per_word <= 16)
+		return 2;
+	else
+		return 4;
 }
 
 static bool spi_imx_can_dma(struct spi_master *master, struct spi_device *spi,
 			 struct spi_transfer *transfer)
 {
 	struct spi_imx_data *spi_imx = spi_master_get_devdata(master);
-	unsigned int bytes_per_word, i;
 
 	if (!master->dma_rx)
 		return false;
@@ -218,20 +224,9 @@ static bool spi_imx_can_dma(struct spi_master *master, struct spi_device *spi,
 	if (spi_imx->slave_mode)
 		return false;
 
-	bytes_per_word = spi_imx_bytes_per_word(transfer->bits_per_word);
-
-	if (bytes_per_word != 1 && bytes_per_word != 2 && bytes_per_word != 4)
+	if (transfer->len < spi_imx->devtype_data->fifo_size)
 		return false;
 
-	for (i = spi_imx->devtype_data->fifo_size / 2; i > 0; i--) {
-		if (!(transfer->len % (i * bytes_per_word)))
-			break;
-	}
-
-	if (i == 0)
-		return false;
-
-	spi_imx->wml = i;
 	spi_imx->dynamic_burst = 0;
 
 	return true;
@@ -291,26 +286,39 @@ static void spi_imx_buf_rx_swap_u32(struct spi_imx_data *spi_imx)
 		else if (bytes_per_word == 2)
 			val = (val << 16) | (val >> 16);
 #endif
-		val &= spi_imx->word_mask;
 		*(u32 *)spi_imx->rx_buf = val;
 		spi_imx->rx_buf += sizeof(u32);
 	}
+
+	spi_imx->remainder -= sizeof(u32);
 }
 
 static void spi_imx_buf_rx_swap(struct spi_imx_data *spi_imx)
 {
-	unsigned int bytes_per_word;
+	int unaligned;
+	u32 val;
 
-	bytes_per_word = spi_imx_bytes_per_word(spi_imx->bits_per_word);
-	if (spi_imx->read_u32) {
+	unaligned = spi_imx->remainder % 4;
+
+	if (!unaligned) {
 		spi_imx_buf_rx_swap_u32(spi_imx);
 		return;
 	}
 
-	if (bytes_per_word == 1)
-		spi_imx_buf_rx_u8(spi_imx);
-	else if (bytes_per_word == 2)
+	if (spi_imx_bytes_per_word(spi_imx->bits_per_word) == 2) {
 		spi_imx_buf_rx_u16(spi_imx);
+		return;
+	}
+
+	val = readl(spi_imx->base + MXC_CSPIRXDATA);
+
+	while (unaligned--) {
+		if (spi_imx->rx_buf) {
+			*(u8 *)spi_imx->rx_buf = (val >> (8 * unaligned)) & 0xff;
+			spi_imx->rx_buf++;
+		}
+		spi_imx->remainder--;
+	}
 }
 
 static void spi_imx_buf_tx_swap_u32(struct spi_imx_data *spi_imx)
@@ -322,7 +330,6 @@ static void spi_imx_buf_tx_swap_u32(struct spi_imx_data *spi_imx)
 
 	if (spi_imx->tx_buf) {
 		val = *(u32 *)spi_imx->tx_buf;
-		val &= spi_imx->word_mask;
 		spi_imx->tx_buf += sizeof(u32);
 	}
 
@@ -340,40 +347,30 @@ static void spi_imx_buf_tx_swap_u32(struct spi_imx_data *spi_imx)
 
 static void spi_imx_buf_tx_swap(struct spi_imx_data *spi_imx)
 {
-	u32 ctrl, val;
-	unsigned int bytes_per_word;
+	int unaligned;
+	u32 val = 0;
 
-	if (spi_imx->count == spi_imx->remainder) {
-		ctrl = readl(spi_imx->base + MX51_ECSPI_CTRL);
-		ctrl &= ~MX51_ECSPI_CTRL_BL_MASK;
-		if (spi_imx->count > MX51_ECSPI_CTRL_MAX_BURST) {
-			spi_imx->remainder = spi_imx->count %
-					     MX51_ECSPI_CTRL_MAX_BURST;
-			val = MX51_ECSPI_CTRL_MAX_BURST * 8 - 1;
-		} else if (spi_imx->count >= sizeof(u32)) {
-			spi_imx->remainder = spi_imx->count % sizeof(u32);
-			val = (spi_imx->count - spi_imx->remainder) * 8 - 1;
-		} else {
-			spi_imx->remainder = 0;
-			val = spi_imx->bits_per_word - 1;
-			spi_imx->read_u32 = 0;
-		}
+	unaligned = spi_imx->count % 4;
 
-		ctrl |= (val << MX51_ECSPI_CTRL_BL_OFFSET);
-		writel(ctrl, spi_imx->base + MX51_ECSPI_CTRL);
-	}
-
-	if (spi_imx->count >= sizeof(u32)) {
+	if (!unaligned) {
 		spi_imx_buf_tx_swap_u32(spi_imx);
 		return;
 	}
 
-	bytes_per_word = spi_imx_bytes_per_word(spi_imx->bits_per_word);
-
-	if (bytes_per_word == 1)
-		spi_imx_buf_tx_u8(spi_imx);
-	else if (bytes_per_word == 2)
+	if (spi_imx_bytes_per_word(spi_imx->bits_per_word) == 2) {
 		spi_imx_buf_tx_u16(spi_imx);
+		return;
+	}
+
+	while (unaligned--) {
+		if (spi_imx->tx_buf) {
+			val |= *(u8 *)spi_imx->tx_buf << (8 * unaligned);
+			spi_imx->tx_buf++;
+		}
+		spi_imx->count--;
+	}
+
+	writel(val, spi_imx->base + MXC_CSPITXDATA);
 }
 
 static void mx53_ecspi_rx_slave(struct spi_imx_data *spi_imx)
@@ -392,6 +389,8 @@ static void mx53_ecspi_rx_slave(struct spi_imx_data *spi_imx)
 		spi_imx->rx_buf += n_bytes;
 		spi_imx->slave_burst -= n_bytes;
 	}
+
+	spi_imx->remainder -= sizeof(u32);
 }
 
 static void mx53_ecspi_tx_slave(struct spi_imx_data *spi_imx)
@@ -579,18 +578,21 @@ static int mx51_ecspi_config(struct spi_device *spi)
 	else			/* SCLK is _very_ slow */
 		usleep_range(delay, delay + 10);
 
+	return 0;
+}
+
+static void mx51_setup_wml(struct spi_imx_data *spi_imx)
+{
 	/*
 	 * Configure the DMA register: setup the watermark
 	 * and enable DMA request.
 	 */
 
-	writel(MX51_ECSPI_DMA_RX_WML(spi_imx->wml) |
+	writel(MX51_ECSPI_DMA_RX_WML(spi_imx->wml - 1) |
 		MX51_ECSPI_DMA_TX_WML(spi_imx->wml) |
 		MX51_ECSPI_DMA_RXT_WML(spi_imx->wml) |
 		MX51_ECSPI_DMA_TEDEN | MX51_ECSPI_DMA_RXDEN |
 		MX51_ECSPI_DMA_RXTDEN, spi_imx->base + MX51_ECSPI_DMA);
-
-	return 0;
 }
 
 static int mx51_ecspi_rx_available(struct spi_imx_data *spi_imx)
@@ -927,6 +929,7 @@ static struct spi_imx_devtype_data imx51_ecspi_devtype_data = {
 	.trigger = mx51_ecspi_trigger,
 	.rx_available = mx51_ecspi_rx_available,
 	.reset = mx51_ecspi_reset,
+	.setup_wml = mx51_setup_wml,
 	.fifo_size = 64,
 	.has_dmamode = true,
 	.dynamic_burst = true,
@@ -1001,12 +1004,52 @@ static void spi_imx_chipselect(struct spi_device *spi, int is_active)
 	gpio_set_value(spi->cs_gpio, dev_is_lowactive ^ active);
 }
 
+static void spi_imx_set_burst_len(struct spi_imx_data *spi_imx, int n_bits)
+{
+	u32 ctrl;
+
+	ctrl = readl(spi_imx->base + MX51_ECSPI_CTRL);
+	ctrl &= ~MX51_ECSPI_CTRL_BL_MASK;
+	ctrl |= ((n_bits - 1) << MX51_ECSPI_CTRL_BL_OFFSET);
+	writel(ctrl, spi_imx->base + MX51_ECSPI_CTRL);
+}
+
 static void spi_imx_push(struct spi_imx_data *spi_imx)
 {
+	unsigned int burst_len, fifo_words;
+
+	if (spi_imx->dynamic_burst)
+		fifo_words = 4;
+	else
+		fifo_words = spi_imx_bytes_per_word(spi_imx->bits_per_word);
+	/*
+	 * Reload the FIFO when the remaining bytes to be transferred in the
+	 * current burst is 0. This only applies when bits_per_word is a
+	 * multiple of 8.
+	 */
+	if (!spi_imx->remainder) {
+		if (spi_imx->dynamic_burst) {
+
+			/* We need to deal unaligned data first */
+			burst_len = spi_imx->count % MX51_ECSPI_CTRL_MAX_BURST;
+
+			if (!burst_len)
+				burst_len = MX51_ECSPI_CTRL_MAX_BURST;
+
+			spi_imx_set_burst_len(spi_imx, burst_len * 8);
+
+			spi_imx->remainder = burst_len;
+		} else {
+			spi_imx->remainder = fifo_words;
+		}
+	}
+
 	while (spi_imx->txfifo < spi_imx->devtype_data->fifo_size) {
 		if (!spi_imx->count)
 			break;
-		if (spi_imx->txfifo && (spi_imx->count == spi_imx->remainder))
+		if (spi_imx->dynamic_burst &&
+		    spi_imx->txfifo >=  DIV_ROUND_UP(spi_imx->remainder,
+						     fifo_words))
 			break;
 		spi_imx->tx(spi_imx);
 		spi_imx->txfifo++;
@@ -1094,7 +1137,6 @@ static int spi_imx_setupxfer(struct spi_device *spi,
 				 struct spi_transfer *t)
 {
 	struct spi_imx_data *spi_imx = spi_master_get_devdata(spi->master);
-	int ret;
 
 	if (!t)
 		return 0;
@@ -1102,27 +1144,20 @@ static int spi_imx_setupxfer(struct spi_device *spi,
 	spi_imx->bits_per_word = t->bits_per_word;
 	spi_imx->speed_hz  = t->speed_hz;
 
-	/* Initialize the functions for transfer */
-	if (spi_imx->devtype_data->dynamic_burst && !spi_imx->slave_mode) {
-		u32 mask;
+	/*
+	 * Initialize the functions for transfer. To transfer non byte-aligned
+	 * words, we have to use multiple word-size bursts, we can't use
+	 * dynamic_burst in that case.
+	 */
+	if (spi_imx->devtype_data->dynamic_burst && !spi_imx->slave_mode &&
+	    (spi_imx->bits_per_word == 8 ||
+	    spi_imx->bits_per_word == 16 ||
+	    spi_imx->bits_per_word == 32)) {
 
-		spi_imx->dynamic_burst = 0;
-		spi_imx->remainder = 0;
-		spi_imx->read_u32  = 1;
-
-		mask = (1 << spi_imx->bits_per_word) - 1;
 		spi_imx->rx = spi_imx_buf_rx_swap;
 		spi_imx->tx = spi_imx_buf_tx_swap;
 		spi_imx->dynamic_burst = 1;
-		spi_imx->remainder = t->len;
 
-		if (spi_imx->bits_per_word <= 8)
-			spi_imx->word_mask = mask << 24 | mask << 16
-					     | mask << 8 | mask;
-		else if (spi_imx->bits_per_word <= 16)
-			spi_imx->word_mask = mask << 16 | mask;
-		else
-			spi_imx->word_mask = mask;
 	} else {
 		if (spi_imx->bits_per_word <= 8) {
 			spi_imx->rx = spi_imx_buf_rx_u8;
@@ -1134,18 +1169,13 @@ static int spi_imx_setupxfer(struct spi_device *spi,
 			spi_imx->rx = spi_imx_buf_rx_u32;
 			spi_imx->tx = spi_imx_buf_tx_u32;
 		}
+		spi_imx->dynamic_burst = 0;
 	}
 
 	if (spi_imx_can_dma(spi_imx->bitbang.master, spi, t))
 		spi_imx->usedma = 1;
 	else
 		spi_imx->usedma = 0;
-
-	if (spi_imx->usedma) {
-		ret = spi_imx_dma_configure(spi->master);
-		if (ret)
-			return ret;
-	}
 
 	if (is_imx53_ecspi(spi_imx) && spi_imx->slave_mode) {
 		spi_imx->rx = mx53_ecspi_rx_slave;
@@ -1251,6 +1281,31 @@ static int spi_imx_dma_transfer(struct spi_imx_data *spi_imx,
 	unsigned long timeout;
 	struct spi_master *master = spi_imx->bitbang.master;
 	struct sg_table *tx = &transfer->tx_sg, *rx = &transfer->rx_sg;
+	struct scatterlist *last_sg = sg_last(rx->sgl, rx->nents);
+	unsigned int bytes_per_word, i;
+	int ret;
+
+	/* Get the right burst length from the last sg to ensure no tail data */
+	bytes_per_word = spi_imx_bytes_per_word(transfer->bits_per_word);
+	for (i = spi_imx->devtype_data->fifo_size / 2; i > 0; i--) {
+		if (!(sg_dma_len(last_sg) % (i * bytes_per_word)))
+			break;
+	}
+	/* Use 1 as wml in case no available burst length got */
+	if (i == 0)
+		i = 1;
+
+	spi_imx->wml =  i;
+
+	ret = spi_imx_dma_configure(master);
+	if (ret)
+		return ret;
+
+	if (!spi_imx->devtype_data->setup_wml) {
+		dev_err(spi_imx->dev, "No setup_wml()?\n");
+		return -EINVAL;
+	}
+	spi_imx->devtype_data->setup_wml(spi_imx);
 
 	/*
 	 * The TX DMA setup starts the transfer, so make sure RX is configured
@@ -1317,6 +1372,7 @@ static int spi_imx_pio_transfer(struct spi_device *spi,
 	spi_imx->rx_buf = transfer->rx_buf;
 	spi_imx->count = transfer->len;
 	spi_imx->txfifo = 0;
+	spi_imx->remainder = 0;
 
 	reinit_completion(&spi_imx->xfer_done);
 
@@ -1354,6 +1410,7 @@ static int spi_imx_pio_transfer_slave(struct spi_device *spi,
 	spi_imx->rx_buf = transfer->rx_buf;
 	spi_imx->count = transfer->len;
 	spi_imx->txfifo = 0;
+	spi_imx->remainder = 0;
 
 	reinit_completion(&spi_imx->xfer_done);
 	spi_imx->slave_aborted = false;

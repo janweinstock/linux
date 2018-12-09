@@ -45,8 +45,6 @@ enum hqd_dequeue_request_type {
 	RESET_WAVES
 };
 
-struct vi_sdma_mqd;
-
 /*
  * Register access functions
  */
@@ -100,7 +98,7 @@ static uint16_t get_fw_version(struct kgd_dev *kgd, enum kgd_engine_type type);
 static void set_scratch_backing_va(struct kgd_dev *kgd,
 					uint64_t va, uint32_t vmid);
 static void set_vm_context_page_table_base(struct kgd_dev *kgd, uint32_t vmid,
-		uint32_t page_table_base);
+		uint64_t page_table_base);
 static int invalidate_tlbs(struct kgd_dev *kgd, uint16_t pasid);
 static int invalidate_tlbs_vmid(struct kgd_dev *kgd, uint16_t vmid);
 
@@ -164,6 +162,7 @@ static const struct kfd2kgd_calls kfd2kgd = {
 	.create_process_vm = amdgpu_amdkfd_gpuvm_create_process_vm,
 	.acquire_process_vm = amdgpu_amdkfd_gpuvm_acquire_process_vm,
 	.destroy_process_vm = amdgpu_amdkfd_gpuvm_destroy_process_vm,
+	.release_process_vm = amdgpu_amdkfd_gpuvm_release_process_vm,
 	.get_process_page_dir = amdgpu_amdkfd_gpuvm_get_process_page_dir,
 	.set_vm_context_page_table_base = set_vm_context_page_table_base,
 	.alloc_memory_of_gpu = amdgpu_amdkfd_gpuvm_alloc_memory_of_gpu,
@@ -176,6 +175,9 @@ static const struct kfd2kgd_calls kfd2kgd = {
 	.invalidate_tlbs = invalidate_tlbs,
 	.invalidate_tlbs_vmid = invalidate_tlbs_vmid,
 	.submit_ib = amdgpu_amdkfd_submit_ib,
+	.get_vm_fault_info = amdgpu_amdkfd_gpuvm_get_vm_fault_info,
+	.gpu_recover = amdgpu_amdkfd_gpu_reset,
+	.set_compute_idle = amdgpu_amdkfd_set_compute_idle
 };
 
 struct kfd2kgd_calls *amdgpu_amdkfd_gfx_8_0_get_functions(void)
@@ -278,7 +280,8 @@ static int kgd_init_interrupts(struct kgd_dev *kgd, uint32_t pipe_id)
 
 	lock_srbm(kgd, mec, pipe, 0, 0);
 
-	WREG32(mmCPC_INT_CNTL, CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK);
+	WREG32(mmCPC_INT_CNTL, CP_INT_CNTL_RING0__TIME_STAMP_INT_ENABLE_MASK |
+			CP_INT_CNTL_RING0__OPCODE_ERROR_INT_ENABLE_MASK);
 
 	unlock_srbm(kgd);
 
@@ -568,6 +571,9 @@ static int kgd_hqd_destroy(struct kgd_dev *kgd, void *mqd,
 	int retry;
 	struct vi_mqd *m = get_mqd(mqd);
 
+	if (adev->in_gpu_reset)
+		return -EIO;
+
 	acquire_queue(kgd, pipe_id, queue_id);
 
 	if (m->cp_hqd_vmid == 0)
@@ -827,7 +833,7 @@ static uint16_t get_fw_version(struct kgd_dev *kgd, enum kgd_engine_type type)
 }
 
 static void set_vm_context_page_table_base(struct kgd_dev *kgd, uint32_t vmid,
-		uint32_t page_table_base)
+		uint64_t page_table_base)
 {
 	struct amdgpu_device *adev = get_amdgpu_device(kgd);
 
@@ -835,7 +841,8 @@ static void set_vm_context_page_table_base(struct kgd_dev *kgd, uint32_t vmid,
 		pr_err("trying to set page table base for wrong VMID\n");
 		return;
 	}
-	WREG32(mmVM_CONTEXT8_PAGE_TABLE_BASE_ADDR + vmid - 8, page_table_base);
+	WREG32(mmVM_CONTEXT8_PAGE_TABLE_BASE_ADDR + vmid - 8,
+			lower_32_bits(page_table_base));
 }
 
 static int invalidate_tlbs(struct kgd_dev *kgd, uint16_t pasid)
@@ -843,6 +850,9 @@ static int invalidate_tlbs(struct kgd_dev *kgd, uint16_t pasid)
 	struct amdgpu_device *adev = (struct amdgpu_device *) kgd;
 	int vmid;
 	unsigned int tmp;
+
+	if (adev->in_gpu_reset)
+		return -EIO;
 
 	for (vmid = 0; vmid < 16; vmid++) {
 		if (!amdgpu_amdkfd_is_kfd_vmid(adev, vmid))

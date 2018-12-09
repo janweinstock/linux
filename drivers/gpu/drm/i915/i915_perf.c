@@ -210,6 +210,7 @@
 #include "i915_oa_cflgt3.h"
 #include "i915_oa_cnl.h"
 #include "i915_oa_icl.h"
+#include "intel_lrc_reg.h"
 
 /* HW requires this to be a power of two, between 128k and 16M, though driver
  * is currently generally designed assuming the largest 16M size is used such
@@ -315,7 +316,7 @@ static u32 i915_oa_max_sample_rate = 100000;
  * code assumes all reports have a power-of-two size and ~(size - 1) can
  * be used as a mask to align the OA tail pointer.
  */
-static struct i915_oa_format hsw_oa_formats[I915_OA_FORMAT_MAX] = {
+static const struct i915_oa_format hsw_oa_formats[I915_OA_FORMAT_MAX] = {
 	[I915_OA_FORMAT_A13]	    = { 0, 64 },
 	[I915_OA_FORMAT_A29]	    = { 1, 128 },
 	[I915_OA_FORMAT_A13_B8_C8]  = { 2, 128 },
@@ -326,7 +327,7 @@ static struct i915_oa_format hsw_oa_formats[I915_OA_FORMAT_MAX] = {
 	[I915_OA_FORMAT_C4_B8]	    = { 7, 64 },
 };
 
-static struct i915_oa_format gen8_plus_oa_formats[I915_OA_FORMAT_MAX] = {
+static const struct i915_oa_format gen8_plus_oa_formats[I915_OA_FORMAT_MAX] = {
 	[I915_OA_FORMAT_A12]		    = { 0, 64 },
 	[I915_OA_FORMAT_A12_B8_C8]	    = { 2, 128 },
 	[I915_OA_FORMAT_A32u40_A4u32_B8_C8] = { 5, 256 },
@@ -737,12 +738,7 @@ static int gen8_append_oa_reports(struct i915_perf_stream *stream,
 			continue;
 		}
 
-		/*
-		 * XXX: Just keep the lower 21 bits for now since I'm not
-		 * entirely sure if the HW touches any of the higher bits in
-		 * this field
-		 */
-		ctx_id = report32[2] & 0x1fffff;
+		ctx_id = report32[2] & dev_priv->perf.oa.specific_ctx_id_mask;
 
 		/*
 		 * Squash whatever is in the CTX_ID field if it's marked as
@@ -1203,6 +1199,33 @@ static int i915_oa_read(struct i915_perf_stream *stream,
 	return dev_priv->perf.oa.ops.read(stream, buf, count, offset);
 }
 
+static struct intel_context *oa_pin_context(struct drm_i915_private *i915,
+					    struct i915_gem_context *ctx)
+{
+	struct intel_engine_cs *engine = i915->engine[RCS];
+	struct intel_context *ce;
+	int ret;
+
+	ret = i915_mutex_lock_interruptible(&i915->drm);
+	if (ret)
+		return ERR_PTR(ret);
+
+	/*
+	 * As the ID is the gtt offset of the context's vma we
+	 * pin the vma to ensure the ID remains fixed.
+	 *
+	 * NB: implied RCS engine...
+	 */
+	ce = intel_context_pin(ctx, engine);
+	mutex_unlock(&i915->drm.struct_mutex);
+	if (IS_ERR(ce))
+		return ce;
+
+	i915->perf.oa.pinned_ctx = ce;
+
+	return ce;
+}
+
 /**
  * oa_get_render_ctx_id - determine and hold ctx hw id
  * @stream: An i915-perf stream opened for OA metrics
@@ -1215,39 +1238,75 @@ static int i915_oa_read(struct i915_perf_stream *stream,
  */
 static int oa_get_render_ctx_id(struct i915_perf_stream *stream)
 {
-	struct drm_i915_private *dev_priv = stream->dev_priv;
+	struct drm_i915_private *i915 = stream->dev_priv;
+	struct intel_context *ce;
 
-	if (HAS_LOGICAL_RING_CONTEXTS(dev_priv)) {
-		dev_priv->perf.oa.specific_ctx_id = stream->ctx->hw_id;
-	} else {
-		struct intel_engine_cs *engine = dev_priv->engine[RCS];
-		struct intel_ring *ring;
-		int ret;
+	ce = oa_pin_context(i915, stream->ctx);
+	if (IS_ERR(ce))
+		return PTR_ERR(ce);
 
-		ret = i915_mutex_lock_interruptible(&dev_priv->drm);
-		if (ret)
-			return ret;
-
+	switch (INTEL_GEN(i915)) {
+	case 7: {
 		/*
-		 * As the ID is the gtt offset of the context's vma we
-		 * pin the vma to ensure the ID remains fixed.
-		 *
-		 * NB: implied RCS engine...
+		 * On Haswell we don't do any post processing of the reports
+		 * and don't need to use the mask.
 		 */
-		ring = intel_context_pin(stream->ctx, engine);
-		mutex_unlock(&dev_priv->drm.struct_mutex);
-		if (IS_ERR(ring))
-			return PTR_ERR(ring);
-
-
-		/*
-		 * Explicitly track the ID (instead of calling
-		 * i915_ggtt_offset() on the fly) considering the difference
-		 * with gen8+ and execlists
-		 */
-		dev_priv->perf.oa.specific_ctx_id =
-			i915_ggtt_offset(to_intel_context(stream->ctx, engine)->state);
+		i915->perf.oa.specific_ctx_id = i915_ggtt_offset(ce->state);
+		i915->perf.oa.specific_ctx_id_mask = 0;
+		break;
 	}
+
+	case 8:
+	case 9:
+	case 10:
+		if (USES_GUC_SUBMISSION(i915)) {
+			/*
+			 * When using GuC, the context descriptor we write in
+			 * i915 is read by GuC and rewritten before it's
+			 * actually written into the hardware. The LRCA is
+			 * what is put into the context id field of the
+			 * context descriptor by GuC. Because it's aligned to
+			 * a page, the lower 12bits are always at 0 and
+			 * dropped by GuC. They won't be part of the context
+			 * ID in the OA reports, so squash those lower bits.
+			 */
+			i915->perf.oa.specific_ctx_id =
+				lower_32_bits(ce->lrc_desc) >> 12;
+
+			/*
+			 * GuC uses the top bit to signal proxy submission, so
+			 * ignore that bit.
+			 */
+			i915->perf.oa.specific_ctx_id_mask =
+				(1U << (GEN8_CTX_ID_WIDTH - 1)) - 1;
+		} else {
+			i915->perf.oa.specific_ctx_id_mask =
+				(1U << GEN8_CTX_ID_WIDTH) - 1;
+			i915->perf.oa.specific_ctx_id =
+				upper_32_bits(ce->lrc_desc);
+			i915->perf.oa.specific_ctx_id &=
+				i915->perf.oa.specific_ctx_id_mask;
+		}
+		break;
+
+	case 11: {
+		i915->perf.oa.specific_ctx_id_mask =
+			((1U << GEN11_SW_CTX_ID_WIDTH) - 1) << (GEN11_SW_CTX_ID_SHIFT - 32) |
+			((1U << GEN11_ENGINE_INSTANCE_WIDTH) - 1) << (GEN11_ENGINE_INSTANCE_SHIFT - 32) |
+			((1 << GEN11_ENGINE_CLASS_WIDTH) - 1) << (GEN11_ENGINE_CLASS_SHIFT - 32);
+		i915->perf.oa.specific_ctx_id = upper_32_bits(ce->lrc_desc);
+		i915->perf.oa.specific_ctx_id &=
+			i915->perf.oa.specific_ctx_id_mask;
+		break;
+	}
+
+	default:
+		MISSING_CASE(INTEL_GEN(i915));
+	}
+
+	DRM_DEBUG_DRIVER("filtering on ctx_id=0x%x ctx_id_mask=0x%x\n",
+			 i915->perf.oa.specific_ctx_id,
+			 i915->perf.oa.specific_ctx_id_mask);
 
 	return 0;
 }
@@ -1262,17 +1321,15 @@ static int oa_get_render_ctx_id(struct i915_perf_stream *stream)
 static void oa_put_render_ctx_id(struct i915_perf_stream *stream)
 {
 	struct drm_i915_private *dev_priv = stream->dev_priv;
+	struct intel_context *ce;
 
-	if (HAS_LOGICAL_RING_CONTEXTS(dev_priv)) {
-		dev_priv->perf.oa.specific_ctx_id = INVALID_CTX_ID;
-	} else {
-		struct intel_engine_cs *engine = dev_priv->engine[RCS];
+	dev_priv->perf.oa.specific_ctx_id = INVALID_CTX_ID;
+	dev_priv->perf.oa.specific_ctx_id_mask = 0;
 
+	ce = fetch_and_zero(&dev_priv->perf.oa.pinned_ctx);
+	if (ce) {
 		mutex_lock(&dev_priv->drm.struct_mutex);
-
-		dev_priv->perf.oa.specific_ctx_id = INVALID_CTX_ID;
-		intel_context_unpin(stream->ctx, engine);
-
+		intel_context_unpin(ce);
 		mutex_unlock(&dev_priv->drm.struct_mutex);
 	}
 }
@@ -1282,14 +1339,12 @@ free_oa_buffer(struct drm_i915_private *i915)
 {
 	mutex_lock(&i915->drm.struct_mutex);
 
-	i915_gem_object_unpin_map(i915->perf.oa.oa_buffer.vma->obj);
-	i915_vma_unpin(i915->perf.oa.oa_buffer.vma);
-	i915_gem_object_put(i915->perf.oa.oa_buffer.vma->obj);
-
-	i915->perf.oa.oa_buffer.vma = NULL;
-	i915->perf.oa.oa_buffer.vaddr = NULL;
+	i915_vma_unpin_and_release(&i915->perf.oa.oa_buffer.vma,
+				   I915_VMA_RELEASE_MAP);
 
 	mutex_unlock(&i915->drm.struct_mutex);
+
+	i915->perf.oa.oa_buffer.vaddr = NULL;
 }
 
 static void i915_oa_stream_destroy(struct i915_perf_stream *stream)
@@ -1582,27 +1637,25 @@ static void gen8_update_reg_state_unlocked(struct i915_gem_context *ctx,
 	u32 ctx_oactxctrl = dev_priv->perf.oa.ctx_oactxctrl_offset;
 	u32 ctx_flexeu0 = dev_priv->perf.oa.ctx_flexeu0_offset;
 	/* The MMIO offsets for Flex EU registers aren't contiguous */
-	u32 flex_mmio[] = {
-		i915_mmio_reg_offset(EU_PERF_CNTL0),
-		i915_mmio_reg_offset(EU_PERF_CNTL1),
-		i915_mmio_reg_offset(EU_PERF_CNTL2),
-		i915_mmio_reg_offset(EU_PERF_CNTL3),
-		i915_mmio_reg_offset(EU_PERF_CNTL4),
-		i915_mmio_reg_offset(EU_PERF_CNTL5),
-		i915_mmio_reg_offset(EU_PERF_CNTL6),
+	i915_reg_t flex_regs[] = {
+		EU_PERF_CNTL0,
+		EU_PERF_CNTL1,
+		EU_PERF_CNTL2,
+		EU_PERF_CNTL3,
+		EU_PERF_CNTL4,
+		EU_PERF_CNTL5,
+		EU_PERF_CNTL6,
 	};
 	int i;
 
-	reg_state[ctx_oactxctrl] = i915_mmio_reg_offset(GEN8_OACTXCONTROL);
-	reg_state[ctx_oactxctrl+1] = (dev_priv->perf.oa.period_exponent <<
-				      GEN8_OA_TIMER_PERIOD_SHIFT) |
-				     (dev_priv->perf.oa.periodic ?
-				      GEN8_OA_TIMER_ENABLE : 0) |
-				     GEN8_OA_COUNTER_RESUME;
+	CTX_REG(reg_state, ctx_oactxctrl, GEN8_OACTXCONTROL,
+		(dev_priv->perf.oa.period_exponent << GEN8_OA_TIMER_PERIOD_SHIFT) |
+		(dev_priv->perf.oa.periodic ? GEN8_OA_TIMER_ENABLE : 0) |
+		GEN8_OA_COUNTER_RESUME);
 
-	for (i = 0; i < ARRAY_SIZE(flex_mmio); i++) {
+	for (i = 0; i < ARRAY_SIZE(flex_regs); i++) {
 		u32 state_offset = ctx_flexeu0 + i * 2;
-		u32 mmio = flex_mmio[i];
+		u32 mmio = i915_mmio_reg_offset(flex_regs[i]);
 
 		/*
 		 * This arbitrary default will select the 'EU FPU0 Pipeline
@@ -1622,110 +1675,8 @@ static void gen8_update_reg_state_unlocked(struct i915_gem_context *ctx,
 			}
 		}
 
-		reg_state[state_offset] = mmio;
-		reg_state[state_offset+1] = value;
+		CTX_REG(reg_state, state_offset, flex_regs[i], value);
 	}
-}
-
-/*
- * Same as gen8_update_reg_state_unlocked only through the batchbuffer. This
- * is only used by the kernel context.
- */
-static int gen8_emit_oa_config(struct i915_request *rq,
-			       const struct i915_oa_config *oa_config)
-{
-	struct drm_i915_private *dev_priv = rq->i915;
-	/* The MMIO offsets for Flex EU registers aren't contiguous */
-	u32 flex_mmio[] = {
-		i915_mmio_reg_offset(EU_PERF_CNTL0),
-		i915_mmio_reg_offset(EU_PERF_CNTL1),
-		i915_mmio_reg_offset(EU_PERF_CNTL2),
-		i915_mmio_reg_offset(EU_PERF_CNTL3),
-		i915_mmio_reg_offset(EU_PERF_CNTL4),
-		i915_mmio_reg_offset(EU_PERF_CNTL5),
-		i915_mmio_reg_offset(EU_PERF_CNTL6),
-	};
-	u32 *cs;
-	int i;
-
-	cs = intel_ring_begin(rq, ARRAY_SIZE(flex_mmio) * 2 + 4);
-	if (IS_ERR(cs))
-		return PTR_ERR(cs);
-
-	*cs++ = MI_LOAD_REGISTER_IMM(ARRAY_SIZE(flex_mmio) + 1);
-
-	*cs++ = i915_mmio_reg_offset(GEN8_OACTXCONTROL);
-	*cs++ = (dev_priv->perf.oa.period_exponent << GEN8_OA_TIMER_PERIOD_SHIFT) |
-		(dev_priv->perf.oa.periodic ? GEN8_OA_TIMER_ENABLE : 0) |
-		GEN8_OA_COUNTER_RESUME;
-
-	for (i = 0; i < ARRAY_SIZE(flex_mmio); i++) {
-		u32 mmio = flex_mmio[i];
-
-		/*
-		 * This arbitrary default will select the 'EU FPU0 Pipeline
-		 * Active' event. In the future it's anticipated that there
-		 * will be an explicit 'No Event' we can select, but not
-		 * yet...
-		 */
-		u32 value = 0;
-
-		if (oa_config) {
-			u32 j;
-
-			for (j = 0; j < oa_config->flex_regs_len; j++) {
-				if (i915_mmio_reg_offset(oa_config->flex_regs[j].addr) == mmio) {
-					value = oa_config->flex_regs[j].value;
-					break;
-				}
-			}
-		}
-
-		*cs++ = mmio;
-		*cs++ = value;
-	}
-
-	*cs++ = MI_NOOP;
-	intel_ring_advance(rq, cs);
-
-	return 0;
-}
-
-static int gen8_switch_to_updated_kernel_context(struct drm_i915_private *dev_priv,
-						 const struct i915_oa_config *oa_config)
-{
-	struct intel_engine_cs *engine = dev_priv->engine[RCS];
-	struct i915_timeline *timeline;
-	struct i915_request *rq;
-	int ret;
-
-	lockdep_assert_held(&dev_priv->drm.struct_mutex);
-
-	i915_retire_requests(dev_priv);
-
-	rq = i915_request_alloc(engine, dev_priv->kernel_context);
-	if (IS_ERR(rq))
-		return PTR_ERR(rq);
-
-	ret = gen8_emit_oa_config(rq, oa_config);
-	if (ret) {
-		i915_request_add(rq);
-		return ret;
-	}
-
-	/* Queue this switch after all other activity */
-	list_for_each_entry(timeline, &dev_priv->gt.timelines, link) {
-		struct i915_request *prev;
-
-		prev = i915_gem_active_raw(&timeline->last_request,
-					   &dev_priv->drm.struct_mutex);
-		if (prev)
-			i915_request_await_dma_fence(rq, &prev->fence);
-	}
-
-	i915_request_add(rq);
-
-	return 0;
 }
 
 /*
@@ -1756,16 +1707,12 @@ static int gen8_configure_all_contexts(struct drm_i915_private *dev_priv,
 				       const struct i915_oa_config *oa_config)
 {
 	struct intel_engine_cs *engine = dev_priv->engine[RCS];
+	unsigned int map_type = i915_coherent_map_type(dev_priv);
 	struct i915_gem_context *ctx;
+	struct i915_request *rq;
 	int ret;
-	unsigned int wait_flags = I915_WAIT_LOCKED;
 
 	lockdep_assert_held(&dev_priv->drm.struct_mutex);
-
-	/* Switch away from any user context. */
-	ret = gen8_switch_to_updated_kernel_context(dev_priv, oa_config);
-	if (ret)
-		goto out;
 
 	/*
 	 * The OA register config is setup through the context image. This image
@@ -1780,9 +1727,11 @@ static int gen8_configure_all_contexts(struct drm_i915_private *dev_priv,
 	 * So far the best way to work around this issue seems to be draining
 	 * the GPU from any submitted work.
 	 */
-	ret = i915_gem_wait_for_idle(dev_priv, wait_flags);
+	ret = i915_gem_wait_for_idle(dev_priv,
+				     I915_WAIT_LOCKED,
+				     MAX_SCHEDULE_TIMEOUT);
 	if (ret)
-		goto out;
+		return ret;
 
 	/* Update all contexts now that we've stalled the submission. */
 	list_for_each_entry(ctx, &dev_priv->contexts.list, link) {
@@ -1793,11 +1742,9 @@ static int gen8_configure_all_contexts(struct drm_i915_private *dev_priv,
 		if (!ce->state)
 			continue;
 
-		regs = i915_gem_object_pin_map(ce->state->obj, I915_MAP_WB);
-		if (IS_ERR(regs)) {
-			ret = PTR_ERR(regs);
-			goto out;
-		}
+		regs = i915_gem_object_pin_map(ce->state->obj, map_type);
+		if (IS_ERR(regs))
+			return PTR_ERR(regs);
 
 		ce->state->obj->mm.dirty = true;
 		regs += LRC_STATE_PN * PAGE_SIZE / sizeof(*regs);
@@ -1807,8 +1754,17 @@ static int gen8_configure_all_contexts(struct drm_i915_private *dev_priv,
 		i915_gem_object_unpin_map(ce->state->obj);
 	}
 
- out:
-	return ret;
+	/*
+	 * Apply the configuration by doing one context restore of the edited
+	 * context image.
+	 */
+	rq = i915_request_alloc(engine, dev_priv->kernel_context);
+	if (IS_ERR(rq))
+		return PTR_ERR(rq);
+
+	i915_request_add(rq);
+
+	return 0;
 }
 
 static int gen8_enable_metric_set(struct drm_i915_private *dev_priv,

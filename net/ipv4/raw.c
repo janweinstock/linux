@@ -381,6 +381,7 @@ static int raw_send_hdrinc(struct sock *sk, struct flowi4 *fl4,
 
 	skb->priority = sk->sk_priority;
 	skb->mark = sk->sk_mark;
+	skb->tstamp = sockc->transmit_time;
 	skb_dst_set(skb, &rt->dst);
 	*rtp = NULL;
 
@@ -561,13 +562,7 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		daddr = inet->inet_daddr;
 	}
 
-	ipc.sockc.tsflags = sk->sk_tsflags;
-	ipc.addr = inet->inet_saddr;
-	ipc.opt = NULL;
-	ipc.tx_flags = 0;
-	ipc.ttl = 0;
-	ipc.tos = -1;
-	ipc.oif = sk->sk_bound_dev_if;
+	ipcm_init_sk(&ipc, inet);
 
 	if (msg->msg_controllen) {
 		err = ip_cmsg_send(sk, msg, &ipc, false);
@@ -613,7 +608,7 @@ static int raw_sendmsg(struct sock *sk, struct msghdr *msg, size_t len)
 		tos |= RTO_ONLINK;
 
 	if (ipv4_is_multicast(daddr)) {
-		if (!ipc.oif)
+		if (!ipc.oif || netif_index_is_l3_master(sock_net(sk), ipc.oif))
 			ipc.oif = inet->mc_index;
 		if (!saddr)
 			saddr = inet->mc_addr;
@@ -670,8 +665,6 @@ back_from_confirm:
 				      &rt, msg->msg_flags, &ipc.sockc);
 
 	 else {
-		sock_tx_timestamp(sk, ipc.sockc.tsflags, &ipc.tx_flags);
-
 		if (!ipc.addr)
 			ipc.addr = fl4.daddr;
 		lock_sock(sk);

@@ -56,6 +56,7 @@
 #include <asm/opal.h>
 #include <asm/firmware.h>
 #include <asm/code-patching.h>
+#include <asm/sections.h>
 
 #ifdef CONFIG_PPC64
 #include <asm/hvcall.h>
@@ -244,6 +245,7 @@ Commands:\n\
   f	flush cache\n\
   la	lookup symbol+offset of specified address\n\
   ls	lookup address of specified symbol\n\
+  lp s [#]	lookup address of percpu symbol s for current cpu, or cpu #\n\
   m	examine/change memory\n\
   mm	move a block of memory\n\
   ms	set a block of memory\n\
@@ -918,13 +920,13 @@ static void remove_cpu_bpts(void)
 static void
 show_uptime(void)
 {
-	struct timespec uptime;
+	struct timespec64 uptime;
 
 	if (setjmp(bus_error_jmp) == 0) {
 		catch_memory_errors = 1;
 		sync();
 
-		get_monotonic_boottime(&uptime);
+		ktime_get_coarse_boottime_ts64(&uptime);
 		printf("Uptime: %lu.%.2lu seconds\n", (unsigned long)uptime.tv_sec,
 			((unsigned long)uptime.tv_nsec / (NSEC_PER_SEC/100)));
 
@@ -2376,25 +2378,33 @@ static void dump_one_paca(int cpu)
 	DUMP(p, cpu_start, "%#-*x");
 	DUMP(p, kexec_state, "%#-*x");
 #ifdef CONFIG_PPC_BOOK3S_64
-	for (i = 0; i < SLB_NUM_BOLTED; i++) {
-		u64 esid, vsid;
+	if (!early_radix_enabled()) {
+		for (i = 0; i < SLB_NUM_BOLTED; i++) {
+			u64 esid, vsid;
 
-		if (!p->slb_shadow_ptr)
-			continue;
+			if (!p->slb_shadow_ptr)
+				continue;
 
-		esid = be64_to_cpu(p->slb_shadow_ptr->save_area[i].esid);
-		vsid = be64_to_cpu(p->slb_shadow_ptr->save_area[i].vsid);
+			esid = be64_to_cpu(p->slb_shadow_ptr->save_area[i].esid);
+			vsid = be64_to_cpu(p->slb_shadow_ptr->save_area[i].vsid);
 
-		if (esid || vsid) {
-			printf(" %-*s[%d] = 0x%016llx 0x%016llx\n",
-			       22, "slb_shadow", i, esid, vsid);
+			if (esid || vsid) {
+				printf(" %-*s[%d] = 0x%016llx 0x%016llx\n",
+				       22, "slb_shadow", i, esid, vsid);
+			}
+		}
+		DUMP(p, vmalloc_sllp, "%#-*x");
+		DUMP(p, stab_rr, "%#-*x");
+		DUMP(p, slb_used_bitmap, "%#-*x");
+		DUMP(p, slb_kern_bitmap, "%#-*x");
+
+		if (!early_cpu_has_feature(CPU_FTR_ARCH_300)) {
+			DUMP(p, slb_cache_ptr, "%#-*x");
+			for (i = 0; i < SLB_CACHE_ENTRIES; i++)
+				printf(" %-*s[%d] = 0x%016x\n",
+				       22, "slb_cache", i, p->slb_cache[i]);
 		}
 	}
-	DUMP(p, vmalloc_sllp, "%#-*x");
-	DUMP(p, slb_cache_ptr, "%#-*x");
-	for (i = 0; i < SLB_CACHE_ENTRIES; i++)
-		printf(" %-*s[%d] = 0x%016x\n",
-		       22, "slb_cache", i, p->slb_cache[i]);
 
 	DUMP(p, rfi_flush_fallback_area, "%-*px");
 #endif
@@ -2410,7 +2420,9 @@ static void dump_one_paca(int cpu)
 	DUMP(p, __current, "%-*px");
 	DUMP(p, kstack, "%#-*llx");
 	printf(" %-*s = 0x%016llx\n", 25, "kstack_base", p->kstack & ~(THREAD_SIZE - 1));
-	DUMP(p, stab_rr, "%#-*llx");
+#ifdef CONFIG_STACKPROTECTOR
+	DUMP(p, canary, "%#-*lx");
+#endif
 	DUMP(p, saved_r1, "%#-*llx");
 	DUMP(p, trap_save, "%#-*x");
 	DUMP(p, irq_soft_mask, "%#-*x");
@@ -2429,7 +2441,6 @@ static void dump_one_paca(int cpu)
 	DUMP(p, thread_idle_state, "%#-*x");
 	DUMP(p, thread_mask, "%#-*x");
 	DUMP(p, subcore_sibling_mask, "%#-*x");
-	DUMP(p, thread_sibling_pacas, "%-*px");
 	DUMP(p, requested_psscr, "%#-*llx");
 	DUMP(p, stop_sprs.pid, "%#-*llx");
 	DUMP(p, stop_sprs.ldbar, "%#-*llx");
@@ -2443,11 +2454,15 @@ static void dump_one_paca(int cpu)
 
 	DUMP(p, accounting.utime, "%#-*lx");
 	DUMP(p, accounting.stime, "%#-*lx");
+#ifdef CONFIG_ARCH_HAS_SCALED_CPUTIME
 	DUMP(p, accounting.utime_scaled, "%#-*lx");
+#endif
 	DUMP(p, accounting.starttime, "%#-*lx");
 	DUMP(p, accounting.starttime_user, "%#-*lx");
+#ifdef CONFIG_ARCH_HAS_SCALED_CPUTIME
 	DUMP(p, accounting.startspurr, "%#-*lx");
 	DUMP(p, accounting.utime_sspurr, "%#-*lx");
+#endif
 	DUMP(p, accounting.steal_time, "%#-*lx");
 #undef DUMP
 
@@ -2734,7 +2749,7 @@ generic_inst_dump(unsigned long adr, long count, int praddr,
 {
 	int nr, dotted;
 	unsigned long first_adr;
-	unsigned long inst, last_inst = 0;
+	unsigned int inst, last_inst = 0;
 	unsigned char val[4];
 
 	dotted = 0;
@@ -2758,7 +2773,7 @@ generic_inst_dump(unsigned long adr, long count, int praddr,
 		dotted = 0;
 		last_inst = inst;
 		if (praddr)
-			printf(REG"  %.8lx", adr, inst);
+			printf(REG"  %.8x", adr, inst);
 		printf("\t");
 		dump_func(inst, adr);
 		printf("\n");
@@ -2987,15 +3002,17 @@ static void show_task(struct task_struct *tsk)
 #ifdef CONFIG_PPC_BOOK3S_64
 void format_pte(void *ptep, unsigned long pte)
 {
+	pte_t entry = __pte(pte);
+
 	printf("ptep @ 0x%016lx = 0x%016lx\n", (unsigned long)ptep, pte);
 	printf("Maps physical address = 0x%016lx\n", pte & PTE_RPN_MASK);
 
 	printf("Flags = %s%s%s%s%s\n",
-	       (pte & _PAGE_ACCESSED) ? "Accessed " : "",
-	       (pte & _PAGE_DIRTY)    ? "Dirty " : "",
-	       (pte & _PAGE_READ)     ? "Read " : "",
-	       (pte & _PAGE_WRITE)    ? "Write " : "",
-	       (pte & _PAGE_EXEC)     ? "Exec " : "");
+	       pte_young(entry) ? "Accessed " : "",
+	       pte_dirty(entry) ? "Dirty " : "",
+	       pte_read(entry)  ? "Read " : "",
+	       pte_write(entry) ? "Write " : "",
+	       pte_exec(entry)  ? "Exec " : "");
 }
 
 static void show_pte(unsigned long addr)
@@ -3353,7 +3370,8 @@ static void
 symbol_lookup(void)
 {
 	int type = inchar();
-	unsigned long addr;
+	unsigned long addr, cpu;
+	void __percpu *ptr = NULL;
 	static char tmp[64];
 
 	switch (type) {
@@ -3374,6 +3392,34 @@ symbol_lookup(void)
 				printf("Symbol '%s' not found.\n", tmp);
 			sync();
 		}
+		catch_memory_errors = 0;
+		termch = 0;
+		break;
+	case 'p':
+		getstring(tmp, 64);
+		if (setjmp(bus_error_jmp) == 0) {
+			catch_memory_errors = 1;
+			sync();
+			ptr = (void __percpu *)kallsyms_lookup_name(tmp);
+			sync();
+		}
+
+		if (ptr &&
+		    ptr >= (void __percpu *)__per_cpu_start &&
+		    ptr < (void __percpu *)__per_cpu_end)
+		{
+			if (scanhex(&cpu) && cpu < num_possible_cpus()) {
+				addr = (unsigned long)per_cpu_ptr(ptr, cpu);
+			} else {
+				cpu = raw_smp_processor_id();
+				addr = (unsigned long)this_cpu_ptr(ptr);
+			}
+
+			printf("%s for cpu 0x%lx: %lx\n", tmp, cpu, addr);
+		} else {
+			printf("Percpu symbol '%s' not found.\n", tmp);
+		}
+
 		catch_memory_errors = 0;
 		termch = 0;
 		break;

@@ -329,9 +329,9 @@ of ftrace. Here is a list of some of the key files:
 	track of the time spent in those functions. The histogram
 	content can be displayed in the files:
 
-	trace_stats/function<cpu> ( function0, function1, etc).
+	trace_stat/function<cpu> ( function0, function1, etc).
 
-  trace_stats:
+  trace_stat:
 
 	A directory that holds different tracing stats.
 
@@ -2986,6 +2986,9 @@ The following commands are supported:
   ring buffer for the current CPU to the console. Unlike the "dump"
   command, it only prints out the contents of the ring buffer for the
   CPU that executed the function that triggered the dump.
+
+- stacktrace:
+  When the function is hit, a stack trace is recorded.
 
 trace_pipe
 ----------

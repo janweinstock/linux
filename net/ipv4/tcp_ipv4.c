@@ -155,12 +155,26 @@ int tcp_twsk_unique(struct sock *sk, struct sock *sktw, void *twp)
 	   and use initial timestamp retrieved from peer table.
 	 */
 	if (tcptw->tw_ts_recent_stamp &&
-	    (!twp || (reuse && get_seconds() - tcptw->tw_ts_recent_stamp > 1))) {
-		tp->write_seq = tcptw->tw_snd_nxt + 65535 + 2;
-		if (tp->write_seq == 0)
-			tp->write_seq = 1;
-		tp->rx_opt.ts_recent	   = tcptw->tw_ts_recent;
-		tp->rx_opt.ts_recent_stamp = tcptw->tw_ts_recent_stamp;
+	    (!twp || (reuse && time_after32(ktime_get_seconds(),
+					    tcptw->tw_ts_recent_stamp)))) {
+		/* In case of repair and re-using TIME-WAIT sockets we still
+		 * want to be sure that it is safe as above but honor the
+		 * sequence numbers and time stamps set as part of the repair
+		 * process.
+		 *
+		 * Without this check re-using a TIME-WAIT socket with TCP
+		 * repair would accumulate a -1 on the repair assigned
+		 * sequence number. The first time it is reused the sequence
+		 * is -1, the second time -2, etc. This fixes that issue
+		 * without appearing to create any others.
+		 */
+		if (likely(!tp->repair)) {
+			tp->write_seq = tcptw->tw_snd_nxt + 65535 + 2;
+			if (tp->write_seq == 0)
+				tp->write_seq = 1;
+			tp->rx_opt.ts_recent	   = tcptw->tw_ts_recent;
+			tp->rx_opt.ts_recent_stamp = tcptw->tw_ts_recent_stamp;
+		}
 		sock_hold(sktw);
 		return 1;
 	}
@@ -530,7 +544,7 @@ void tcp_v4_err(struct sk_buff *icmp_skb, u32 info)
 		BUG_ON(!skb);
 
 		tcp_mstamp_refresh(tp);
-		delta_us = (u32)(tp->tcp_mstamp - skb->skb_mstamp);
+		delta_us = (u32)(tp->tcp_mstamp - tcp_skb_timestamp_us(skb));
 		remaining = icsk->icsk_rto -
 			    usecs_to_jiffies(delta_us);
 
@@ -929,9 +943,11 @@ static int tcp_v4_send_synack(const struct sock *sk, struct dst_entry *dst,
 	if (skb) {
 		__tcp_v4_send_check(skb, ireq->ir_loc_addr, ireq->ir_rmt_addr);
 
+		rcu_read_lock();
 		err = ip_build_and_send_pkt(skb, sk, ireq->ir_loc_addr,
 					    ireq->ir_rmt_addr,
-					    ireq_opt_deref(ireq));
+					    rcu_dereference(ireq->ireq_opt));
+		rcu_read_unlock();
 		err = net_xmit_eval(err);
 	}
 
@@ -2503,6 +2519,12 @@ static int __net_init tcp_sk_init(struct net *net)
 		if (res)
 			goto fail;
 		sock_set_flag(sk, SOCK_USE_WRITE_QUEUE);
+
+		/* Please enforce IP_DF and IPID==0 for RST and
+		 * ACK sent in SYN-RECV and TIME-WAIT state.
+		 */
+		inet_sk(sk)->pmtudisc = IP_PMTUDISC_DO;
+
 		*per_cpu_ptr(net->ipv4.tcp_sk, cpu) = sk;
 	}
 
@@ -2529,7 +2551,7 @@ static int __net_init tcp_sk_init(struct net *net)
 	net->ipv4.sysctl_tcp_tw_reuse = 2;
 
 	cnt = tcp_hashinfo.ehash_mask + 1;
-	net->ipv4.tcp_death_row.sysctl_max_tw_buckets = (cnt + 1) / 2;
+	net->ipv4.tcp_death_row.sysctl_max_tw_buckets = cnt / 2;
 	net->ipv4.tcp_death_row.hashinfo = &tcp_hashinfo;
 
 	net->ipv4.sysctl_max_syn_backlog = max(128, cnt / 256);

@@ -667,14 +667,35 @@ enum qed_link_mode_bits {
 	QED_LM_Autoneg_BIT = BIT(1),
 	QED_LM_Asym_Pause_BIT = BIT(2),
 	QED_LM_Pause_BIT = BIT(3),
-	QED_LM_1000baseT_Half_BIT = BIT(4),
-	QED_LM_1000baseT_Full_BIT = BIT(5),
+	QED_LM_1000baseT_Full_BIT = BIT(4),
+	QED_LM_10000baseT_Full_BIT = BIT(5),
 	QED_LM_10000baseKR_Full_BIT = BIT(6),
-	QED_LM_25000baseKR_Full_BIT = BIT(7),
-	QED_LM_40000baseLR4_Full_BIT = BIT(8),
-	QED_LM_50000baseKR2_Full_BIT = BIT(9),
-	QED_LM_100000baseKR4_Full_BIT = BIT(10),
-	QED_LM_COUNT = 11
+	QED_LM_20000baseKR2_Full_BIT = BIT(7),
+	QED_LM_25000baseKR_Full_BIT = BIT(8),
+	QED_LM_40000baseLR4_Full_BIT = BIT(9),
+	QED_LM_50000baseKR2_Full_BIT = BIT(10),
+	QED_LM_100000baseKR4_Full_BIT = BIT(11),
+	QED_LM_2500baseX_Full_BIT = BIT(12),
+	QED_LM_Backplane_BIT = BIT(13),
+	QED_LM_1000baseKX_Full_BIT = BIT(14),
+	QED_LM_10000baseKX4_Full_BIT = BIT(15),
+	QED_LM_10000baseR_FEC_BIT = BIT(16),
+	QED_LM_40000baseKR4_Full_BIT = BIT(17),
+	QED_LM_40000baseCR4_Full_BIT = BIT(18),
+	QED_LM_40000baseSR4_Full_BIT = BIT(19),
+	QED_LM_25000baseCR_Full_BIT = BIT(20),
+	QED_LM_25000baseSR_Full_BIT = BIT(21),
+	QED_LM_50000baseCR2_Full_BIT = BIT(22),
+	QED_LM_100000baseSR4_Full_BIT = BIT(23),
+	QED_LM_100000baseCR4_Full_BIT = BIT(24),
+	QED_LM_100000baseLR4_ER4_Full_BIT = BIT(25),
+	QED_LM_50000baseSR2_Full_BIT = BIT(26),
+	QED_LM_1000baseX_Full_BIT = BIT(27),
+	QED_LM_10000baseCR_Full_BIT = BIT(28),
+	QED_LM_10000baseSR_Full_BIT = BIT(29),
+	QED_LM_10000baseLR_Full_BIT = BIT(30),
+	QED_LM_10000baseLRM_Full_BIT = BIT(31),
+	QED_LM_COUNT = 32
 };
 
 struct qed_link_params {
@@ -758,6 +779,9 @@ struct qed_generic_tlvs {
 #define QED_TLV_MAC_COUNT	3
 	u8 mac[QED_TLV_MAC_COUNT][ETH_ALEN];
 };
+
+#define QED_I2C_DEV_ADDR_A0 0xA0
+#define QED_I2C_DEV_ADDR_A2 0xA2
 
 #define QED_NVM_SIGNATURE 0x12435687
 
@@ -1026,6 +1050,18 @@ struct qed_common_ops {
  * @param enabled - true iff WoL should be enabled.
  */
 	int (*update_wol) (struct qed_dev *cdev, bool enabled);
+
+/**
+ * @brief read_module_eeprom
+ *
+ * @param cdev
+ * @param buf - buffer
+ * @param dev_addr - PHY device memory region
+ * @param offset - offset into eeprom contents to be read
+ * @param len - buffer length, i.e., max bytes to be read
+ */
+	int (*read_module_eeprom)(struct qed_dev *cdev,
+				  char *buf, u8 dev_addr, u32 offset, u32 len);
 };
 
 #define MASK_FIELD(_name, _value) \

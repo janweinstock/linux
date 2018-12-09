@@ -2265,7 +2265,7 @@ MODULE_DEVICE_TABLE(of, tda1997x_of_id);
 static int tda1997x_parse_dt(struct tda1997x_state *state)
 {
 	struct tda1997x_platform_data *pdata = &state->pdata;
-	struct v4l2_fwnode_endpoint bus_cfg;
+	struct v4l2_fwnode_endpoint bus_cfg = { .bus_type = 0 };
 	struct device_node *ep;
 	struct device_node *np;
 	unsigned int flags;
@@ -2570,7 +2570,7 @@ static int tda1997x_probe(struct i2c_client *client,
 		 id->name, i2c_adapter_id(client->adapter),
 		 client->addr);
 	sd->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE | V4L2_SUBDEV_FL_HAS_EVENTS;
-	sd->entity.function = MEDIA_ENT_F_DTV_DECODER;
+	sd->entity.function = MEDIA_ENT_F_DV_DECODER;
 	sd->entity.ops = &tda1997x_media_ops;
 
 	/* set allowed mbus modes based on chip, bus-type, and bus-width */

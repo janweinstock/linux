@@ -12,7 +12,7 @@
 # Note the danger in using -Wall -Wextra is that when CI updates gcc we
 # will most likely get a sudden build breakage... Hopefully we will fix
 # new warnings before CI updates!
-subdir-ccflags-y := -Wall -Wextra -Wvla
+subdir-ccflags-y := -Wall -Wextra
 subdir-ccflags-y += $(call cc-disable-warning, unused-parameter)
 subdir-ccflags-y += $(call cc-disable-warning, type-limits)
 subdir-ccflags-y += $(call cc-disable-warning, missing-field-initializers)
@@ -135,15 +135,14 @@ i915-y += dvo_ch7017.o \
 	  dvo_ns2501.o \
 	  dvo_sil164.o \
 	  dvo_tfp410.o \
+	  icl_dsi.o \
 	  intel_crt.o \
 	  intel_ddi.o \
 	  intel_dp_aux_backlight.o \
 	  intel_dp_link_training.o \
 	  intel_dp_mst.o \
 	  intel_dp.o \
-	  intel_dsi.o \
 	  intel_dsi_dcs_backlight.o \
-	  intel_dsi_pll.o \
 	  intel_dsi_vbt.o \
 	  intel_dvo.o \
 	  intel_hdmi.o \
@@ -152,7 +151,9 @@ i915-y += dvo_ch7017.o \
 	  intel_lvds.o \
 	  intel_panel.o \
 	  intel_sdvo.o \
-	  intel_tv.o
+	  intel_tv.o \
+	  vlv_dsi.o \
+	  vlv_dsi_pll.o
 
 # Post-mortem debug and GPU hang state capture
 i915-$(CONFIG_DRM_I915_CAPTURE_ERROR) += i915_gpu_error.o

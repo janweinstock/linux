@@ -639,7 +639,7 @@ static int dsa_slave_set_eee(struct net_device *dev, struct ethtool_eee *e)
 	int ret;
 
 	/* Port's PHY and MAC both need to be EEE capable */
-	if (!dev->phydev)
+	if (!dev->phydev && !dp->pl)
 		return -ENODEV;
 
 	if (!ds->ops->set_mac_eee)
@@ -659,7 +659,7 @@ static int dsa_slave_get_eee(struct net_device *dev, struct ethtool_eee *e)
 	int ret;
 
 	/* Port's PHY and MAC both need to be EEE capable */
-	if (!dev->phydev)
+	if (!dev->phydev && !dp->pl)
 		return -ENODEV;
 
 	if (!ds->ops->get_mac_eee)
@@ -722,7 +722,7 @@ static void dsa_slave_netpoll_cleanup(struct net_device *dev)
 
 	p->netpoll = NULL;
 
-	__netpoll_free_async(netpoll);
+	__netpoll_free(netpoll);
 }
 
 static void dsa_slave_poll_controller(struct net_device *dev)
@@ -767,7 +767,6 @@ static int dsa_slave_add_cls_matchall(struct net_device *dev,
 	const struct tc_action *a;
 	struct dsa_port *to_dp;
 	int err = -EOPNOTSUPP;
-	LIST_HEAD(actions);
 
 	if (!ds->ops->port_mirror_add)
 		return err;
@@ -775,8 +774,7 @@ static int dsa_slave_add_cls_matchall(struct net_device *dev,
 	if (!tcf_exts_has_one_action(cls->exts))
 		return err;
 
-	tcf_exts_to_list(cls->exts, &actions);
-	a = list_first_entry(&actions, struct tc_action, list);
+	a = tcf_exts_first_action(cls->exts);
 
 	if (is_tcf_mirred_egress_mirror(a) && protocol == htons(ETH_P_ALL)) {
 		struct dsa_mall_mirror_tc_entry *mirror;
@@ -900,7 +898,7 @@ static int dsa_slave_setup_tc_block(struct net_device *dev,
 
 	switch (f->command) {
 	case TC_BLOCK_BIND:
-		return tcf_block_cb_register(f->block, cb, dev, dev);
+		return tcf_block_cb_register(f->block, cb, dev, dev, f->extack);
 	case TC_BLOCK_UNBIND:
 		tcf_block_cb_unregister(f->block, cb, dev);
 		return 0;
@@ -1058,6 +1056,27 @@ static const struct switchdev_ops dsa_slave_switchdev_ops = {
 
 static struct device_type dsa_type = {
 	.name	= "dsa",
+};
+
+static ssize_t tagging_show(struct device *d, struct device_attribute *attr,
+			    char *buf)
+{
+	struct net_device *dev = to_net_dev(d);
+	struct dsa_port *dp = dsa_slave_to_port(dev);
+
+	return sprintf(buf, "%s\n",
+		       dsa_tag_protocol_to_str(dp->cpu_dp->tag_ops));
+}
+static DEVICE_ATTR_RO(tagging);
+
+static struct attribute *dsa_slave_attrs[] = {
+	&dev_attr_tagging.attr,
+	NULL
+};
+
+static const struct attribute_group dsa_group = {
+	.name	= "dsa",
+	.attrs	= dsa_slave_attrs,
 };
 
 static void dsa_slave_phylink_validate(struct net_device *dev,
@@ -1248,6 +1267,9 @@ int dsa_slave_suspend(struct net_device *slave_dev)
 {
 	struct dsa_port *dp = dsa_slave_to_port(slave_dev);
 
+	if (!netif_running(slave_dev))
+		return 0;
+
 	netif_device_detach(slave_dev);
 
 	rtnl_lock();
@@ -1260,6 +1282,9 @@ int dsa_slave_suspend(struct net_device *slave_dev)
 int dsa_slave_resume(struct net_device *slave_dev)
 {
 	struct dsa_port *dp = dsa_slave_to_port(slave_dev);
+
+	if (!netif_running(slave_dev))
+		return 0;
 
 	netif_device_attach(slave_dev);
 
@@ -1349,8 +1374,14 @@ int dsa_slave_create(struct dsa_port *port)
 		goto out_phy;
 	}
 
+	ret = sysfs_create_group(&slave_dev->dev.kobj, &dsa_group);
+	if (ret)
+		goto out_unreg;
+
 	return 0;
 
+out_unreg:
+	unregister_netdev(slave_dev);
 out_phy:
 	rtnl_lock();
 	phylink_disconnect_phy(p->dp->pl);
@@ -1374,6 +1405,7 @@ void dsa_slave_destroy(struct net_device *slave_dev)
 	rtnl_unlock();
 
 	dsa_slave_notify(slave_dev, DSA_PORT_UNREGISTER);
+	sysfs_remove_group(&slave_dev->dev.kobj, &dsa_group);
 	unregister_netdev(slave_dev);
 	phylink_destroy(dp->pl);
 	free_percpu(p->stats64);
@@ -1446,6 +1478,7 @@ static void dsa_slave_switchdev_event_work(struct work_struct *work)
 			netdev_dbg(dev, "fdb add failed err=%d\n", err);
 			break;
 		}
+		fdb_info->offloaded = true;
 		call_switchdev_notifiers(SWITCHDEV_FDB_OFFLOADED, dev,
 					 &fdb_info->info);
 		break;

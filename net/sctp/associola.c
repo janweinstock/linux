@@ -115,6 +115,9 @@ static struct sctp_association *sctp_association_init(
 	/* Initialize path max retrans value. */
 	asoc->pathmaxrxt = sp->pathmaxrxt;
 
+	asoc->flowlabel = sp->flowlabel;
+	asoc->dscp = sp->dscp;
+
 	/* Initialize default path MTU. */
 	asoc->pathmtu = sp->pathmtu;
 
@@ -496,8 +499,9 @@ void sctp_assoc_set_primary(struct sctp_association *asoc,
 void sctp_assoc_rm_peer(struct sctp_association *asoc,
 			struct sctp_transport *peer)
 {
-	struct list_head	*pos;
-	struct sctp_transport	*transport;
+	struct sctp_transport *transport;
+	struct list_head *pos;
+	struct sctp_chunk *ch;
 
 	pr_debug("%s: association:%p addr:%pISpc\n",
 		 __func__, asoc, &peer->ipaddr.sa);
@@ -561,7 +565,6 @@ void sctp_assoc_rm_peer(struct sctp_association *asoc,
 	 */
 	if (!list_empty(&peer->transmitted)) {
 		struct sctp_transport *active = asoc->peer.active_path;
-		struct sctp_chunk *ch;
 
 		/* Reset the transport of each chunk on this list */
 		list_for_each_entry(ch, &peer->transmitted,
@@ -582,6 +585,10 @@ void sctp_assoc_rm_peer(struct sctp_association *asoc,
 					jiffies + active->rto))
 				sctp_transport_hold(active);
 	}
+
+	list_for_each_entry(ch, &asoc->outqueue.out_chunk_list, list)
+		if (ch->transport == peer)
+			ch->transport = NULL;
 
 	asoc->peer.transport_count--;
 
@@ -646,6 +653,18 @@ struct sctp_transport *sctp_assoc_add_peer(struct sctp_association *asoc,
 	 */
 	peer->sackdelay = asoc->sackdelay;
 	peer->sackfreq = asoc->sackfreq;
+
+	if (addr->sa.sa_family == AF_INET6) {
+		__be32 info = addr->v6.sin6_flowinfo;
+
+		if (info) {
+			peer->flowlabel = ntohl(info & IPV6_FLOWLABEL_MASK);
+			peer->flowlabel |= SCTP_FLOWLABEL_SET_MASK;
+		} else {
+			peer->flowlabel = asoc->flowlabel;
+		}
+	}
+	peer->dscp = asoc->dscp;
 
 	/* Enable/disable heartbeat, SACK delay, and path MTU discovery
 	 * based on association setting.
@@ -1435,7 +1454,8 @@ void sctp_assoc_sync_pmtu(struct sctp_association *asoc)
 	/* Get the lowest pmtu of all the transports. */
 	list_for_each_entry(t, &asoc->peer.transport_addr_list, transports) {
 		if (t->pmtu_pending && t->dst) {
-			sctp_transport_update_pmtu(t, sctp_dst_mtu(t->dst));
+			sctp_transport_update_pmtu(t,
+						   atomic_read(&t->mtu_info));
 			t->pmtu_pending = 0;
 		}
 		if (!pmtu || (t->pathmtu < pmtu))

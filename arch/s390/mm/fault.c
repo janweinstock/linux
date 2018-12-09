@@ -341,7 +341,8 @@ static noinline int signal_return(struct pt_regs *regs)
 	return -EACCES;
 }
 
-static noinline void do_fault_error(struct pt_regs *regs, int access, int fault)
+static noinline void do_fault_error(struct pt_regs *regs, int access,
+					vm_fault_t fault)
 {
 	int si_code;
 
@@ -401,7 +402,7 @@ static noinline void do_fault_error(struct pt_regs *regs, int access, int fault)
  *   11       Page translation     ->  Not present       (nullification)
  *   3b       Region third trans.  ->  Not present       (nullification)
  */
-static inline int do_exception(struct pt_regs *regs, int access)
+static inline vm_fault_t do_exception(struct pt_regs *regs, int access)
 {
 	struct gmap *gmap;
 	struct task_struct *tsk;
@@ -411,7 +412,7 @@ static inline int do_exception(struct pt_regs *regs, int access)
 	unsigned long trans_exc_code;
 	unsigned long address;
 	unsigned int flags;
-	int fault;
+	vm_fault_t fault;
 
 	tsk = current;
 	/*
@@ -502,6 +503,8 @@ retry:
 	/* No reason to continue if interrupted by SIGKILL. */
 	if ((fault & VM_FAULT_RETRY) && fatal_signal_pending(current)) {
 		fault = VM_FAULT_SIGNAL;
+		if (flags & FAULT_FLAG_RETRY_NOWAIT)
+			goto out_up;
 		goto out;
 	}
 	if (unlikely(fault & VM_FAULT_ERROR))
@@ -562,7 +565,8 @@ out:
 void do_protection_exception(struct pt_regs *regs)
 {
 	unsigned long trans_exc_code;
-	int access, fault;
+	int access;
+	vm_fault_t fault;
 
 	trans_exc_code = regs->int_parm_long;
 	/*
@@ -597,7 +601,8 @@ NOKPROBE_SYMBOL(do_protection_exception);
 
 void do_dat_exception(struct pt_regs *regs)
 {
-	int access, fault;
+	int access;
+	vm_fault_t fault;
 
 	access = VM_READ | VM_EXEC | VM_WRITE;
 	fault = do_exception(regs, access);
@@ -631,17 +636,19 @@ struct pfault_refbk {
 	u64 reserved;
 } __attribute__ ((packed, aligned(8)));
 
+static struct pfault_refbk pfault_init_refbk = {
+	.refdiagc = 0x258,
+	.reffcode = 0,
+	.refdwlen = 5,
+	.refversn = 2,
+	.refgaddr = __LC_LPP,
+	.refselmk = 1ULL << 48,
+	.refcmpmk = 1ULL << 48,
+	.reserved = __PF_RES_FIELD
+};
+
 int pfault_init(void)
 {
-	struct pfault_refbk refbk = {
-		.refdiagc = 0x258,
-		.reffcode = 0,
-		.refdwlen = 5,
-		.refversn = 2,
-		.refgaddr = __LC_LPP,
-		.refselmk = 1ULL << 48,
-		.refcmpmk = 1ULL << 48,
-		.reserved = __PF_RES_FIELD };
         int rc;
 
 	if (pfault_disable)
@@ -653,18 +660,20 @@ int pfault_init(void)
 		"1:	la	%0,8\n"
 		"2:\n"
 		EX_TABLE(0b,1b)
-		: "=d" (rc) : "a" (&refbk), "m" (refbk) : "cc");
+		: "=d" (rc)
+		: "a" (&pfault_init_refbk), "m" (pfault_init_refbk) : "cc");
         return rc;
 }
 
+static struct pfault_refbk pfault_fini_refbk = {
+	.refdiagc = 0x258,
+	.reffcode = 1,
+	.refdwlen = 5,
+	.refversn = 2,
+};
+
 void pfault_fini(void)
 {
-	struct pfault_refbk refbk = {
-		.refdiagc = 0x258,
-		.reffcode = 1,
-		.refdwlen = 5,
-		.refversn = 2,
-	};
 
 	if (pfault_disable)
 		return;
@@ -673,7 +682,7 @@ void pfault_fini(void)
 		"	diag	%0,0,0x258\n"
 		"0:	nopr	%%r7\n"
 		EX_TABLE(0b,0b)
-		: : "a" (&refbk), "m" (refbk) : "cc");
+		: : "a" (&pfault_fini_refbk), "m" (pfault_fini_refbk) : "cc");
 }
 
 static DEFINE_SPINLOCK(pfault_lock);

@@ -96,6 +96,10 @@ struct i2caux *dal_i2caux_create(
 		return dal_i2caux_dcn10_create(ctx);
 #endif
 
+#if defined(CONFIG_DRM_AMD_DC_DCN1_01)
+	case DCN_VERSION_1_01:
+		return dal_i2caux_dcn10_create(ctx);
+#endif
 	default:
 		BREAK_TO_DEBUGGER();
 		return NULL;
@@ -254,7 +258,6 @@ bool dal_i2caux_submit_aux_command(
 			break;
 		}
 
-		cmd->payloads->length = request.payload.length;
 		++index_of_payload;
 	}
 

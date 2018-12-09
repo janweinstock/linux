@@ -7,8 +7,6 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
-#include <linux/component.h>
-#include <sound/soc.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 #include <sound/pcm.h>
@@ -124,7 +122,6 @@ static struct snd_pcm_hardware q6asm_dai_hardware_playback = {
 			.rate_max =	48000,				\
 		},							\
 		.name = "MultiMedia"#num,				\
-		.probe = fe_dai_probe,					\
 		.id = MSM_FRONTEND_DAI_MULTIMEDIA##num,			\
 	}
 
@@ -320,10 +317,11 @@ static int q6asm_dai_open(struct snd_pcm_substream *substream)
 	prtd->audio_client = q6asm_audio_client_alloc(dev,
 				(q6asm_cb)event_handler, prtd, stream_id,
 				LEGACY_PCM_MODE);
-	if (!prtd->audio_client) {
+	if (IS_ERR(prtd->audio_client)) {
 		pr_info("%s: Could not allocate memory\n", __func__);
+		ret = PTR_ERR(prtd->audio_client);
 		kfree(prtd);
-		return -ENOMEM;
+		return ret;
 	}
 
 	if (substream->stream == SNDRV_PCM_STREAM_PLAYBACK)
@@ -390,7 +388,9 @@ static int q6asm_dai_close(struct snd_pcm_substream *substream)
 	struct q6asm_dai_rtd *prtd = runtime->private_data;
 
 	if (prtd->audio_client) {
-		q6asm_cmd(prtd->audio_client, CMD_CLOSE);
+		if (prtd->state)
+			q6asm_cmd(prtd->audio_client, CMD_CLOSE);
+
 		q6asm_unmap_memory_regions(substream->stream,
 					   prtd->audio_client);
 		q6asm_audio_client_free(prtd->audio_client);
@@ -492,7 +492,7 @@ static int q6asm_dai_pcm_new(struct snd_soc_pcm_runtime *rtd)
 		}
 	}
 
-	return ret;
+	return 0;
 }
 
 static void q6asm_dai_pcm_free(struct snd_pcm *pcm)
@@ -509,38 +509,6 @@ static void q6asm_dai_pcm_free(struct snd_pcm *pcm)
 		}
 	}
 }
-
-static const struct snd_soc_dapm_route afe_pcm_routes[] = {
-	{"MM_DL1",  NULL, "MultiMedia1 Playback" },
-	{"MM_DL2",  NULL, "MultiMedia2 Playback" },
-	{"MM_DL3",  NULL, "MultiMedia3 Playback" },
-	{"MM_DL4",  NULL, "MultiMedia4 Playback" },
-	{"MM_DL5",  NULL, "MultiMedia5 Playback" },
-	{"MM_DL6",  NULL, "MultiMedia6 Playback" },
-	{"MM_DL7",  NULL, "MultiMedia7 Playback" },
-	{"MM_DL7",  NULL, "MultiMedia8 Playback" },
-	{"MultiMedia1 Capture", NULL, "MM_UL1"},
-	{"MultiMedia2 Capture", NULL, "MM_UL2"},
-	{"MultiMedia3 Capture", NULL, "MM_UL3"},
-	{"MultiMedia4 Capture", NULL, "MM_UL4"},
-	{"MultiMedia5 Capture", NULL, "MM_UL5"},
-	{"MultiMedia6 Capture", NULL, "MM_UL6"},
-	{"MultiMedia7 Capture", NULL, "MM_UL7"},
-	{"MultiMedia8 Capture", NULL, "MM_UL8"},
-
-};
-
-static int fe_dai_probe(struct snd_soc_dai *dai)
-{
-	struct snd_soc_dapm_context *dapm;
-
-	dapm = snd_soc_component_get_dapm(dai->component);
-	snd_soc_dapm_add_routes(dapm, afe_pcm_routes,
-				ARRAY_SIZE(afe_pcm_routes));
-
-	return 0;
-}
-
 
 static const struct snd_soc_component_driver q6asm_fe_dai_component = {
 	.name		= DRV_NAME,
@@ -561,14 +529,15 @@ static struct snd_soc_dai_driver q6asm_fe_dais[] = {
 	Q6ASM_FEDAI_DRIVER(8),
 };
 
-static int q6asm_dai_bind(struct device *dev, struct device *master, void *data)
+static int q6asm_dai_probe(struct platform_device *pdev)
 {
+	struct device *dev = &pdev->dev;
 	struct device_node *node = dev->of_node;
 	struct of_phandle_args args;
 	struct q6asm_dai_data *pdata;
 	int rc;
 
-	pdata = kzalloc(sizeof(struct q6asm_dai_data), GFP_KERNEL);
+	pdata = devm_kzalloc(dev, sizeof(*pdata), GFP_KERNEL);
 	if (!pdata)
 		return -ENOMEM;
 
@@ -580,43 +549,23 @@ static int q6asm_dai_bind(struct device *dev, struct device *master, void *data)
 
 	dev_set_drvdata(dev, pdata);
 
-	return snd_soc_register_component(dev, &q6asm_fe_dai_component,
+	return devm_snd_soc_register_component(dev, &q6asm_fe_dai_component,
 					q6asm_fe_dais,
 					ARRAY_SIZE(q6asm_fe_dais));
 }
-static void q6asm_dai_unbind(struct device *dev, struct device *master,
-			     void *data)
-{
-	struct q6asm_dai_data *pdata = dev_get_drvdata(dev);
 
-	snd_soc_unregister_component(dev);
-
-	kfree(pdata);
-
-}
-
-static const struct component_ops q6asm_dai_comp_ops = {
-	.bind   = q6asm_dai_bind,
-	.unbind = q6asm_dai_unbind,
+static const struct of_device_id q6asm_dai_device_id[] = {
+	{ .compatible = "qcom,q6asm-dais" },
+	{},
 };
-
-static int q6asm_dai_probe(struct platform_device *pdev)
-{
-	return component_add(&pdev->dev, &q6asm_dai_comp_ops);
-}
-
-static int q6asm_dai_dev_remove(struct platform_device *pdev)
-{
-	component_del(&pdev->dev, &q6asm_dai_comp_ops);
-	return 0;
-}
+MODULE_DEVICE_TABLE(of, q6asm_dai_device_id);
 
 static struct platform_driver q6asm_dai_platform_driver = {
 	.driver = {
 		.name = "q6asm-dai",
+		.of_match_table = of_match_ptr(q6asm_dai_device_id),
 	},
 	.probe = q6asm_dai_probe,
-	.remove = q6asm_dai_dev_remove,
 };
 module_platform_driver(q6asm_dai_platform_driver);
 

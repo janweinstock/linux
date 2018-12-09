@@ -289,11 +289,6 @@ static void dce110_stream_encoder_dp_set_stream_attribute(
 
 	struct dce110_stream_encoder *enc110 = DCE110STRENC_FROM_STRENC(enc);
 
-#if defined(CONFIG_DRM_AMD_DC_DCN1_0)
-	if (REG(DP_DB_CNTL))
-		REG_UPDATE(DP_DB_CNTL, DP_DB_DISABLE, 1);
-#endif
-
 	/* set pixel encoding */
 	switch (crtc_timing->pixel_encoding) {
 	case PIXEL_ENCODING_YCBCR422:
@@ -677,6 +672,28 @@ static void dce110_stream_encoder_dvi_set_stream_attribute(
 	ASSERT(crtc_timing->pixel_encoding == PIXEL_ENCODING_RGB);
 	ASSERT(crtc_timing->display_color_depth == COLOR_DEPTH_888);
 	dce110_stream_encoder_set_stream_attribute_helper(enc110, crtc_timing);
+}
+
+/* setup stream encoder in LVDS mode */
+static void dce110_stream_encoder_lvds_set_stream_attribute(
+	struct stream_encoder *enc,
+	struct dc_crtc_timing *crtc_timing)
+{
+	struct dce110_stream_encoder *enc110 = DCE110STRENC_FROM_STRENC(enc);
+	struct bp_encoder_control cntl = {0};
+
+	cntl.action = ENCODER_CONTROL_SETUP;
+	cntl.engine_id = enc110->base.id;
+	cntl.signal = SIGNAL_TYPE_LVDS;
+	cntl.enable_dp_audio = false;
+	cntl.pixel_clock = crtc_timing->pix_clk_khz;
+	cntl.lanes_number = LANE_COUNT_FOUR;
+
+	if (enc110->base.bp->funcs->encoder_control(
+			enc110->base.bp, &cntl) != BP_RESULT_OK)
+		return;
+
+	ASSERT(crtc_timing->pixel_encoding == PIXEL_ENCODING_RGB);
 }
 
 static void dce110_stream_encoder_set_mst_bandwidth(
@@ -1569,6 +1586,8 @@ static const struct stream_encoder_funcs dce110_str_enc_funcs = {
 		dce110_stream_encoder_hdmi_set_stream_attribute,
 	.dvi_set_stream_attribute =
 		dce110_stream_encoder_dvi_set_stream_attribute,
+	.lvds_set_stream_attribute =
+		dce110_stream_encoder_lvds_set_stream_attribute,
 	.set_mst_bandwidth =
 		dce110_stream_encoder_set_mst_bandwidth,
 	.update_hdmi_info_packets =

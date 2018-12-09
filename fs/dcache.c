@@ -26,7 +26,7 @@
 #include <linux/export.h>
 #include <linux/security.h>
 #include <linux/seqlock.h>
-#include <linux/bootmem.h>
+#include <linux/memblock.h>
 #include <linux/bit_spinlock.h>
 #include <linux/rculist_bl.h>
 #include <linux/list_lru.h>
@@ -257,24 +257,10 @@ static void __d_free(struct rcu_head *head)
 	kmem_cache_free(dentry_cache, dentry); 
 }
 
-static void __d_free_external_name(struct rcu_head *head)
-{
-	struct external_name *name = container_of(head, struct external_name,
-						  u.head);
-
-	mod_node_page_state(page_pgdat(virt_to_page(name)),
-			    NR_INDIRECTLY_RECLAIMABLE_BYTES,
-			    -ksize(name));
-
-	kfree(name);
-}
-
 static void __d_free_external(struct rcu_head *head)
 {
 	struct dentry *dentry = container_of(head, struct dentry, d_u.d_rcu);
-
-	__d_free_external_name(&external_name(dentry)->u.head);
-
+	kfree(external_name(dentry));
 	kmem_cache_free(dentry_cache, dentry);
 }
 
@@ -292,7 +278,8 @@ void take_dentry_name_snapshot(struct name_snapshot *name, struct dentry *dentry
 		spin_unlock(&dentry->d_lock);
 		name->name = p->name;
 	} else {
-		memcpy(name->inline_name, dentry->d_iname, DNAME_INLINE_LEN);
+		memcpy(name->inline_name, dentry->d_iname,
+		       dentry->d_name.len + 1);
 		spin_unlock(&dentry->d_lock);
 		name->name = name->inline_name;
 	}
@@ -305,7 +292,7 @@ void release_dentry_name_snapshot(struct name_snapshot *name)
 		struct external_name *p;
 		p = container_of(name->name, struct external_name, name[0]);
 		if (unlikely(atomic_dec_and_test(&p->u.count)))
-			call_rcu(&p->u.head, __d_free_external_name);
+			kfree_rcu(p, u.head);
 	}
 }
 EXPORT_SYMBOL(release_dentry_name_snapshot);
@@ -358,14 +345,11 @@ static void dentry_unlink_inode(struct dentry * dentry)
 	__releases(dentry->d_inode->i_lock)
 {
 	struct inode *inode = dentry->d_inode;
-	bool hashed = !d_unhashed(dentry);
 
-	if (hashed)
-		raw_write_seqcount_begin(&dentry->d_seq);
+	raw_write_seqcount_begin(&dentry->d_seq);
 	__d_clear_type_and_inode(dentry);
 	hlist_del_init(&dentry->d_u.d_alias);
-	if (hashed)
-		raw_write_seqcount_end(&dentry->d_seq);
+	raw_write_seqcount_end(&dentry->d_seq);
 	spin_unlock(&dentry->d_lock);
 	spin_unlock(&inode->i_lock);
 	if (!inode->i_nlink)
@@ -732,16 +716,16 @@ static inline bool fast_dput(struct dentry *dentry)
 		if (dentry->d_lockref.count > 1) {
 			dentry->d_lockref.count--;
 			spin_unlock(&dentry->d_lock);
-			return 1;
+			return true;
 		}
-		return 0;
+		return false;
 	}
 
 	/*
 	 * If we weren't the last ref, we're done.
 	 */
 	if (ret)
-		return 1;
+		return true;
 
 	/*
 	 * Careful, careful. The reference count went down
@@ -770,7 +754,7 @@ static inline bool fast_dput(struct dentry *dentry)
 
 	/* Nothing to do? Dropping the reference was all we needed? */
 	if (d_flags == (DCACHE_REFERENCED | DCACHE_LRU_LIST) && !d_unhashed(dentry))
-		return 1;
+		return true;
 
 	/*
 	 * Not the fast normal case? Get the lock. We've already decremented
@@ -787,7 +771,7 @@ static inline bool fast_dput(struct dentry *dentry)
 	 */
 	if (dentry->d_lockref.count) {
 		spin_unlock(&dentry->d_lock);
-		return 1;
+		return true;
 	}
 
 	/*
@@ -796,7 +780,7 @@ static inline bool fast_dput(struct dentry *dentry)
 	 * set it to 1.
 	 */
 	dentry->d_lockref.count = 1;
-	return 0;
+	return false;
 }
 
 
@@ -1608,7 +1592,6 @@ EXPORT_SYMBOL(d_invalidate);
  
 struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
 {
-	struct external_name *ext = NULL;
 	struct dentry *dentry;
 	char *dname;
 	int err;
@@ -1629,14 +1612,15 @@ struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
 		dname = dentry->d_iname;
 	} else if (name->len > DNAME_INLINE_LEN-1) {
 		size_t size = offsetof(struct external_name, name[1]);
-
-		ext = kmalloc(size + name->len, GFP_KERNEL_ACCOUNT);
-		if (!ext) {
+		struct external_name *p = kmalloc(size + name->len,
+						  GFP_KERNEL_ACCOUNT |
+						  __GFP_RECLAIMABLE);
+		if (!p) {
 			kmem_cache_free(dentry_cache, dentry); 
 			return NULL;
 		}
-		atomic_set(&ext->u.count, 1);
-		dname = ext->name;
+		atomic_set(&p->u.count, 1);
+		dname = p->name;
 	} else  {
 		dname = dentry->d_iname;
 	}	
@@ -1673,12 +1657,6 @@ struct dentry *__d_alloc(struct super_block *sb, const struct qstr *name)
 			kmem_cache_free(dentry_cache, dentry);
 			return NULL;
 		}
-	}
-
-	if (unlikely(ext)) {
-		pg_data_t *pgdat = page_pgdat(virt_to_page(ext));
-		mod_node_page_state(pgdat, NR_INDIRECTLY_RECLAIMABLE_BYTES,
-				    ksize(ext));
 	}
 
 	this_cpu_inc(nr_dentry);
@@ -1892,39 +1870,12 @@ void d_instantiate_new(struct dentry *entry, struct inode *inode)
 	spin_lock(&inode->i_lock);
 	__d_instantiate(entry, inode);
 	WARN_ON(!(inode->i_state & I_NEW));
-	inode->i_state &= ~I_NEW;
+	inode->i_state &= ~I_NEW & ~I_CREATING;
 	smp_mb();
 	wake_up_bit(&inode->i_state, __I_NEW);
 	spin_unlock(&inode->i_lock);
 }
 EXPORT_SYMBOL(d_instantiate_new);
-
-/**
- * d_instantiate_no_diralias - instantiate a non-aliased dentry
- * @entry: dentry to complete
- * @inode: inode to attach to this dentry
- *
- * Fill in inode information in the entry.  If a directory alias is found, then
- * return an error (and drop inode).  Together with d_materialise_unique() this
- * guarantees that a directory inode may never have more than one alias.
- */
-int d_instantiate_no_diralias(struct dentry *entry, struct inode *inode)
-{
-	BUG_ON(!hlist_unhashed(&entry->d_u.d_alias));
-
-	security_d_instantiate(entry, inode);
-	spin_lock(&inode->i_lock);
-	if (S_ISDIR(inode->i_mode) && !hlist_empty(&inode->i_dentry)) {
-		spin_unlock(&inode->i_lock);
-		iput(inode);
-		return -EBUSY;
-	}
-	__d_instantiate(entry, inode);
-	spin_unlock(&inode->i_lock);
-
-	return 0;
-}
-EXPORT_SYMBOL(d_instantiate_no_diralias);
 
 struct dentry *d_make_root(struct inode *root_inode)
 {
@@ -1932,10 +1883,12 @@ struct dentry *d_make_root(struct inode *root_inode)
 
 	if (root_inode) {
 		res = d_alloc_anon(root_inode->i_sb);
-		if (res)
+		if (res) {
+			res->d_flags |= DCACHE_RCUACCESS;
 			d_instantiate(res, root_inode);
-		else
+		} else {
 			iput(root_inode);
+		}
 	}
 	return res;
 }
@@ -2676,33 +2629,6 @@ struct dentry *d_exact_alias(struct dentry *entry, struct inode *inode)
 }
 EXPORT_SYMBOL(d_exact_alias);
 
-/**
- * dentry_update_name_case - update case insensitive dentry with a new name
- * @dentry: dentry to be updated
- * @name: new name
- *
- * Update a case insensitive dentry with new case of name.
- *
- * dentry must have been returned by d_lookup with name @name. Old and new
- * name lengths must match (ie. no d_compare which allows mismatched name
- * lengths).
- *
- * Parent inode i_mutex must be held over d_lookup and into this call (to
- * keep renames and concurrent inserts, and readdir(2) away).
- */
-void dentry_update_name_case(struct dentry *dentry, const struct qstr *name)
-{
-	BUG_ON(!inode_is_locked(dentry->d_parent->d_inode));
-	BUG_ON(dentry->d_name.len != name->len); /* d_lookup gives this */
-
-	spin_lock(&dentry->d_lock);
-	write_seqcount_begin(&dentry->d_seq);
-	memcpy((unsigned char *)dentry->d_name.name, name->name, name->len);
-	write_seqcount_end(&dentry->d_seq);
-	spin_unlock(&dentry->d_lock);
-}
-EXPORT_SYMBOL(dentry_update_name_case);
-
 static void swap_names(struct dentry *dentry, struct dentry *target)
 {
 	if (unlikely(dname_external(target))) {
@@ -2761,7 +2687,7 @@ static void copy_name(struct dentry *dentry, struct dentry *target)
 		dentry->d_name.hash_len = target->d_name.hash_len;
 	}
 	if (old_name && likely(atomic_dec_and_test(&old_name->u.count)))
-		call_rcu(&old_name->u.head, __d_free_external_name);
+		kfree_rcu(old_name, u.head);
 }
 
 /*

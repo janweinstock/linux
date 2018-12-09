@@ -271,7 +271,6 @@ struct nfs4_layoutget {
 	struct nfs4_layoutget_args args;
 	struct nfs4_layoutget_res res;
 	struct rpc_cred *cred;
-	unsigned callback_count;
 	gfp_t gfp_flags;
 };
 
@@ -609,8 +608,13 @@ struct nfs_pgio_args {
 	__u32			count;
 	unsigned int		pgbase;
 	struct page **		pages;
-	const u32 *		bitmask;	/* used by write */
-	enum nfs3_stable_how	stable;		/* used by write */
+	union {
+		unsigned int		replen;			/* used by read */
+		struct {
+			const u32 *		bitmask;	/* used by write */
+			enum nfs3_stable_how	stable;		/* used by write */
+		};
+	};
 };
 
 struct nfs_pgio_res {
@@ -618,10 +622,16 @@ struct nfs_pgio_res {
 	struct nfs_fattr *	fattr;
 	__u32			count;
 	__u32			op_status;
-	int			eof;		/* used by read */
-	struct nfs_writeverf *	verf;		/* used by write */
-	const struct nfs_server *server;	/* used by write */
-
+	union {
+		struct {
+			unsigned int		replen;		/* used by read */
+			int			eof;		/* used by read */
+		};
+		struct {
+			struct nfs_writeverf *	verf;		/* used by write */
+			const struct nfs_server *server;	/* used by write */
+		};
+	};
 };
 
 /*
@@ -1389,9 +1399,11 @@ struct nfs42_copy_args {
 	u64				dst_pos;
 
 	u64				count;
+	bool				sync;
 };
 
 struct nfs42_write_res {
+	nfs4_stateid		stateid;
 	u64			count;
 	struct nfs_writeverf	verifier;
 };
@@ -1402,6 +1414,18 @@ struct nfs42_copy_res {
 	bool				consecutive;
 	bool				synchronous;
 	struct nfs_commitres		commit_res;
+};
+
+struct nfs42_offload_status_args {
+	struct nfs4_sequence_args	osa_seq_args;
+	struct nfs_fh			*osa_src_fh;
+	nfs4_stateid			osa_stateid;
+};
+
+struct nfs42_offload_status_res {
+	struct nfs4_sequence_res	osr_seq_res;
+	uint64_t			osr_count;
+	int				osr_status;
 };
 
 struct nfs42_seek_args {
@@ -1458,11 +1482,10 @@ struct nfs_pgio_header {
 	const struct nfs_rw_ops	*rw_ops;
 	struct nfs_io_completion *io_completion;
 	struct nfs_direct_req	*dreq;
-	spinlock_t		lock;
-	/* fields protected by lock */
+
 	int			pnfs_error;
 	int			error;		/* merge with pnfs_error */
-	unsigned long		good_bytes;	/* boundary of good data */
+	unsigned int		good_bytes;	/* boundary of good data */
 	unsigned long		flags;
 
 	/*

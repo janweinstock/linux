@@ -771,13 +771,8 @@ static int asd_pci_probe(struct pci_dev *dev, const struct pci_device_id *id)
 		goto Err_remove;
 
 	err = -ENODEV;
-	if (!pci_set_dma_mask(dev, DMA_BIT_MASK(64))
-	    && !pci_set_consistent_dma_mask(dev, DMA_BIT_MASK(64)))
-		;
-	else if (!pci_set_dma_mask(dev, DMA_BIT_MASK(32))
-		 && !pci_set_consistent_dma_mask(dev, DMA_BIT_MASK(32)))
-		;
-	else {
+	if (dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(64)) ||
+	    dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(32))) {
 		asd_printk("no suitable DMA mask for %s\n", pci_name(dev));
 		goto Err_remove;
 	}
@@ -1030,8 +1025,10 @@ static int __init aic94xx_init(void)
 
 	aic94xx_transport_template =
 		sas_domain_attach_transport(&aic94xx_transport_functions);
-	if (!aic94xx_transport_template)
+	if (!aic94xx_transport_template) {
+		err = -ENOMEM;
 		goto out_destroy_caches;
+	}
 
 	err = pci_register_driver(&aic94xx_pci_driver);
 	if (err)

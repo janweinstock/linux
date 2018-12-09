@@ -35,7 +35,7 @@
 struct linux_binprm;
 struct cred;
 struct rlimit;
-struct siginfo;
+struct kernel_siginfo;
 struct sembuf;
 struct kern_ipc_perm;
 struct audit_context;
@@ -158,6 +158,27 @@ extern int mmap_min_addr_handler(struct ctl_table *table, int write,
 /* security_inode_init_security callback function to write xattrs */
 typedef int (*initxattrs) (struct inode *inode,
 			   const struct xattr *xattr_array, void *fs_data);
+
+
+/* Keep the kernel_load_data_id enum in sync with kernel_read_file_id */
+#define __data_id_enumify(ENUM, dummy) LOADING_ ## ENUM,
+#define __data_id_stringify(dummy, str) #str,
+
+enum kernel_load_data_id {
+	__kernel_read_file_id(__data_id_enumify)
+};
+
+static const char * const kernel_load_data_str[] = {
+	__kernel_read_file_id(__data_id_stringify)
+};
+
+static inline const char *kernel_load_data_id_str(enum kernel_load_data_id id)
+{
+	if ((unsigned)id >= LOADING_MAX_ID)
+		return kernel_load_data_str[LOADING_UNKNOWN];
+
+	return kernel_load_data_str[id];
+}
 
 #ifdef CONFIG_SECURITY
 
@@ -309,7 +330,7 @@ void security_file_set_fowner(struct file *file);
 int security_file_send_sigiotask(struct task_struct *tsk,
 				 struct fown_struct *fown, int sig);
 int security_file_receive(struct file *file);
-int security_file_open(struct file *file, const struct cred *cred);
+int security_file_open(struct file *file);
 int security_task_alloc(struct task_struct *task, unsigned long clone_flags);
 void security_task_free(struct task_struct *task);
 int security_cred_alloc_blank(struct cred *cred, gfp_t gfp);
@@ -320,6 +341,7 @@ void security_cred_getsecid(const struct cred *c, u32 *secid);
 int security_kernel_act_as(struct cred *new, u32 secid);
 int security_kernel_create_files_as(struct cred *new, struct inode *inode);
 int security_kernel_module_request(char *kmod_name);
+int security_kernel_load_data(enum kernel_load_data_id id);
 int security_kernel_read_file(struct file *file, enum kernel_read_file_id id);
 int security_kernel_post_read_file(struct file *file, char *buf, loff_t size,
 				   enum kernel_read_file_id id);
@@ -339,7 +361,7 @@ int security_task_setrlimit(struct task_struct *p, unsigned int resource,
 int security_task_setscheduler(struct task_struct *p);
 int security_task_getscheduler(struct task_struct *p);
 int security_task_movememory(struct task_struct *p);
-int security_task_kill(struct task_struct *p, struct siginfo *info,
+int security_task_kill(struct task_struct *p, struct kernel_siginfo *info,
 			int sig, const struct cred *cred);
 int security_task_prctl(int option, unsigned long arg2, unsigned long arg3,
 			unsigned long arg4, unsigned long arg5);
@@ -858,8 +880,7 @@ static inline int security_file_receive(struct file *file)
 	return 0;
 }
 
-static inline int security_file_open(struct file *file,
-				     const struct cred *cred)
+static inline int security_file_open(struct file *file)
 {
 	return 0;
 }
@@ -905,6 +926,11 @@ static inline int security_kernel_create_files_as(struct cred *cred,
 }
 
 static inline int security_kernel_module_request(char *kmod_name)
+{
+	return 0;
+}
+
+static inline int security_kernel_load_data(enum kernel_load_data_id id)
 {
 	return 0;
 }
@@ -994,7 +1020,7 @@ static inline int security_task_movememory(struct task_struct *p)
 }
 
 static inline int security_task_kill(struct task_struct *p,
-				     struct siginfo *info, int sig,
+				     struct kernel_siginfo *info, int sig,
 				     const struct cred *cred)
 {
 	return 0;

@@ -53,6 +53,8 @@
 #include "dce/dce_hwseq.h"
 #include "dce/dce_abm.h"
 #include "dce/dce_dmcu.h"
+#include "dce/dce_aux.h"
+#include "dce/dce_i2c.h"
 
 #include "dce/dce_12_0_offset.h"
 #include "dce/dce_12_0_sh_mask.h"
@@ -297,6 +299,20 @@ static const struct dce_opp_shift opp_shift = {
 static const struct dce_opp_mask opp_mask = {
 	OPP_COMMON_MASK_SH_LIST_DCE_120(_MASK)
 };
+ #define aux_engine_regs(id)\
+[id] = {\
+	AUX_COMMON_REG_LIST(id), \
+	.AUX_RESET_MASK = 0 \
+}
+
+static const struct dce110_aux_registers aux_engine_regs[] = {
+		aux_engine_regs(0),
+		aux_engine_regs(1),
+		aux_engine_regs(2),
+		aux_engine_regs(3),
+		aux_engine_regs(4),
+		aux_engine_regs(5)
+};
 
 #define audio_regs(id)\
 [id] = {\
@@ -361,7 +377,56 @@ struct output_pixel_processor *dce120_opp_create(
 			     ctx, inst, &opp_regs[inst], &opp_shift, &opp_mask);
 	return &opp->base;
 }
+struct aux_engine *dce120_aux_engine_create(
+	struct dc_context *ctx,
+	uint32_t inst)
+{
+	struct aux_engine_dce110 *aux_engine =
+		kzalloc(sizeof(struct aux_engine_dce110), GFP_KERNEL);
 
+	if (!aux_engine)
+		return NULL;
+
+	dce110_aux_engine_construct(aux_engine, ctx, inst,
+				    SW_AUX_TIMEOUT_PERIOD_MULTIPLIER * AUX_TIMEOUT_PERIOD,
+				    &aux_engine_regs[inst]);
+
+	return &aux_engine->base;
+}
+#define i2c_inst_regs(id) { I2C_HW_ENGINE_COMMON_REG_LIST(id) }
+
+static const struct dce_i2c_registers i2c_hw_regs[] = {
+		i2c_inst_regs(1),
+		i2c_inst_regs(2),
+		i2c_inst_regs(3),
+		i2c_inst_regs(4),
+		i2c_inst_regs(5),
+		i2c_inst_regs(6),
+};
+
+static const struct dce_i2c_shift i2c_shifts = {
+		I2C_COMMON_MASK_SH_LIST_DCE110(__SHIFT)
+};
+
+static const struct dce_i2c_mask i2c_masks = {
+		I2C_COMMON_MASK_SH_LIST_DCE110(_MASK)
+};
+
+struct dce_i2c_hw *dce120_i2c_hw_create(
+	struct dc_context *ctx,
+	uint32_t inst)
+{
+	struct dce_i2c_hw *dce_i2c_hw =
+		kzalloc(sizeof(struct dce_i2c_hw), GFP_KERNEL);
+
+	if (!dce_i2c_hw)
+		return NULL;
+
+	dce112_i2c_hw_construct(dce_i2c_hw, ctx, inst,
+				    &i2c_hw_regs[inst], &i2c_shifts, &i2c_masks);
+
+	return dce_i2c_hw;
+}
 static const struct bios_registers bios_regs = {
 	.BIOS_SCRATCH_6 = mmBIOS_SCRATCH_6 + NBIO_BASE(mmBIOS_SCRATCH_6_BASE_IDX)
 };
@@ -371,9 +436,10 @@ static const struct resource_caps res_cap = {
 		.num_audio = 7,
 		.num_stream_encoder = 6,
 		.num_pll = 6,
+		.num_ddc = 6,
 };
 
-static const struct dc_debug debug_defaults = {
+static const struct dc_debug_options debug_defaults = {
 		.disable_clock_gate = true,
 };
 
@@ -390,7 +456,7 @@ struct clock_source *dce120_clock_source_create(
 	if (!clk_src)
 		return NULL;
 
-	if (dce110_clk_src_construct(clk_src, ctx, bios, id,
+	if (dce112_clk_src_construct(clk_src, ctx, bios, id,
 				     regs, &cs_shift, &cs_mask)) {
 		clk_src->base.dp_clk_src = dp_clk_src;
 		return &clk_src->base;
@@ -469,6 +535,19 @@ static void destruct(struct dce110_resource_pool *pool)
 		}
 	}
 
+	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+		if (pool->base.engines[i] != NULL)
+			dce110_engine_destroy(&pool->base.engines[i]);
+		if (pool->base.hw_i2cs[i] != NULL) {
+			kfree(pool->base.hw_i2cs[i]);
+			pool->base.hw_i2cs[i] = NULL;
+		}
+		if (pool->base.sw_i2cs[i] != NULL) {
+			kfree(pool->base.sw_i2cs[i]);
+			pool->base.sw_i2cs[i] = NULL;
+		}
+	}
+
 	for (i = 0; i < pool->base.audio_count; i++) {
 		if (pool->base.audios[i])
 			dce_aud_destroy(&pool->base.audios[i]);
@@ -494,8 +573,8 @@ static void destruct(struct dce110_resource_pool *pool)
 	if (pool->base.dmcu != NULL)
 		dce_dmcu_destroy(&pool->base.dmcu);
 
-	if (pool->base.display_clock != NULL)
-		dce_disp_clk_destroy(&pool->base.display_clock);
+	if (pool->base.dccg != NULL)
+		dce_dccg_destroy(&pool->base.dccg);
 }
 
 static void read_dce_straps(
@@ -532,7 +611,6 @@ static const struct encoder_feature_support link_enc_feature = {
 		.flags.bits.IS_HBR3_CAPABLE = true,
 		.flags.bits.IS_TPS3_CAPABLE = true,
 		.flags.bits.IS_TPS4_CAPABLE = true,
-		.flags.bits.IS_YCBCR_CAPABLE = true
 };
 
 static struct link_encoder *dce120_link_encoder_create(
@@ -775,7 +853,7 @@ static void bw_calcs_data_update_from_pplib(struct dc *dc)
 			eng_clks.data[0].clocks_in_khz;
 	clk_ranges.wm_clk_ranges[0].wm_max_eng_clk_in_khz =
 			eng_clks.data[eng_clks.num_levels*3/8].clocks_in_khz - 1;
-	clk_ranges.wm_clk_ranges[0].wm_min_memg_clk_in_khz =
+	clk_ranges.wm_clk_ranges[0].wm_min_mem_clk_in_khz =
 			mem_clks.data[0].clocks_in_khz;
 	clk_ranges.wm_clk_ranges[0].wm_max_mem_clk_in_khz =
 			mem_clks.data[mem_clks.num_levels>>1].clocks_in_khz - 1;
@@ -785,7 +863,7 @@ static void bw_calcs_data_update_from_pplib(struct dc *dc)
 			eng_clks.data[eng_clks.num_levels*3/8].clocks_in_khz;
 	/* 5 GHz instead of data[7].clockInKHz to cover Overdrive */
 	clk_ranges.wm_clk_ranges[1].wm_max_eng_clk_in_khz = 5000000;
-	clk_ranges.wm_clk_ranges[1].wm_min_memg_clk_in_khz =
+	clk_ranges.wm_clk_ranges[1].wm_min_mem_clk_in_khz =
 			mem_clks.data[0].clocks_in_khz;
 	clk_ranges.wm_clk_ranges[1].wm_max_mem_clk_in_khz =
 			mem_clks.data[mem_clks.num_levels>>1].clocks_in_khz - 1;
@@ -795,7 +873,7 @@ static void bw_calcs_data_update_from_pplib(struct dc *dc)
 			eng_clks.data[0].clocks_in_khz;
 	clk_ranges.wm_clk_ranges[2].wm_max_eng_clk_in_khz =
 			eng_clks.data[eng_clks.num_levels*3/8].clocks_in_khz - 1;
-	clk_ranges.wm_clk_ranges[2].wm_min_memg_clk_in_khz =
+	clk_ranges.wm_clk_ranges[2].wm_min_mem_clk_in_khz =
 			mem_clks.data[mem_clks.num_levels>>1].clocks_in_khz;
 	/* 5 GHz instead of data[2].clockInKHz to cover Overdrive */
 	clk_ranges.wm_clk_ranges[2].wm_max_mem_clk_in_khz = 5000000;
@@ -805,7 +883,7 @@ static void bw_calcs_data_update_from_pplib(struct dc *dc)
 			eng_clks.data[eng_clks.num_levels*3/8].clocks_in_khz;
 	/* 5 GHz instead of data[7].clockInKHz to cover Overdrive */
 	clk_ranges.wm_clk_ranges[3].wm_max_eng_clk_in_khz = 5000000;
-	clk_ranges.wm_clk_ranges[3].wm_min_memg_clk_in_khz =
+	clk_ranges.wm_clk_ranges[3].wm_min_mem_clk_in_khz =
 			mem_clks.data[mem_clks.num_levels>>1].clocks_in_khz;
 	/* 5 GHz instead of data[2].clockInKHz to cover Overdrive */
 	clk_ranges.wm_clk_ranges[3].wm_max_mem_clk_in_khz = 5000000;
@@ -848,6 +926,7 @@ static bool construct(
 	dc->caps.i2c_speed_in_khz = 100;
 	dc->caps.max_cursor_size = 128;
 	dc->caps.dual_link_dvi = true;
+	dc->caps.psp_setup_panel_mode = true;
 
 	dc->debug = debug_defaults;
 
@@ -894,11 +973,11 @@ static bool construct(
 		}
 	}
 
-	pool->base.display_clock = dce120_disp_clk_create(ctx);
-	if (pool->base.display_clock == NULL) {
+	pool->base.dccg = dce120_dccg_create(ctx);
+	if (pool->base.dccg == NULL) {
 		dm_error("DC: failed to create display clock!\n");
 		BREAK_TO_DEBUGGER();
-		goto disp_clk_create_fail;
+		goto dccg_create_fail;
 	}
 
 	pool->base.dmcu = dce_dmcu_create(ctx,
@@ -920,6 +999,7 @@ static bool construct(
 		BREAK_TO_DEBUGGER();
 		goto res_create_fail;
 	}
+
 
 	irq_init_data.ctx = dc->ctx;
 	pool->base.irqs = dal_irq_service_dce120_create(&irq_init_data);
@@ -989,6 +1069,24 @@ static bool construct(
 		j++;
 	}
 
+	for (i = 0; i < pool->base.res_cap->num_ddc; i++) {
+		pool->base.engines[i] = dce120_aux_engine_create(ctx, i);
+		if (pool->base.engines[i] == NULL) {
+			BREAK_TO_DEBUGGER();
+			dm_error(
+				"DC:failed to create aux engine!!\n");
+			goto res_create_fail;
+		}
+		pool->base.hw_i2cs[i] = dce120_i2c_hw_create(ctx, i);
+		if (pool->base.hw_i2cs[i] == NULL) {
+			BREAK_TO_DEBUGGER();
+			dm_error(
+				"DC:failed to create i2c engine!!\n");
+			goto res_create_fail;
+		}
+		pool->base.sw_i2cs[i] = NULL;
+	}
+
 	/* valid pipe num */
 	pool->base.pipe_count = j;
 	pool->base.timing_generator_count = j;
@@ -1011,7 +1109,7 @@ static bool construct(
 
 irqs_create_fail:
 controller_create_fail:
-disp_clk_create_fail:
+dccg_create_fail:
 clk_src_create_fail:
 res_create_fail:
 

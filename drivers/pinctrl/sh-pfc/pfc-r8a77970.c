@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: GPL-2.0
 /*
  * R8A77970 processor support - PFC hardware block.
  *
@@ -9,10 +10,6 @@
  * R-Car Gen3 processor support - PFC hardware block.
  *
  * Copyright (C) 2015  Renesas Electronics Corporation
- *
- * This program is free software; you can redistribute it and/or modify
- * it under the terms of the GNU General Public License as published by
- * the Free Software Foundation; version 2 of the License.
  */
 
 #include <linux/io.h>
@@ -21,15 +18,13 @@
 #include "core.h"
 #include "sh_pfc.h"
 
-#define CFG_FLAGS SH_PFC_PIN_CFG_DRIVE_STRENGTH
-
 #define CPU_ALL_PORT(fn, sfx)						\
-	PORT_GP_CFG_22(0, fn, sfx, CFG_FLAGS | SH_PFC_PIN_CFG_IO_VOLTAGE), \
-	PORT_GP_CFG_28(1, fn, sfx, CFG_FLAGS),				\
-	PORT_GP_CFG_17(2, fn, sfx, CFG_FLAGS | SH_PFC_PIN_CFG_IO_VOLTAGE), \
-	PORT_GP_CFG_17(3, fn, sfx, CFG_FLAGS | SH_PFC_PIN_CFG_IO_VOLTAGE), \
-	PORT_GP_CFG_6(4,  fn, sfx, CFG_FLAGS),				\
-	PORT_GP_CFG_15(5, fn, sfx, CFG_FLAGS)
+	PORT_GP_CFG_22(0, fn, sfx, SH_PFC_PIN_CFG_IO_VOLTAGE),		\
+	PORT_GP_28(1, fn, sfx),						\
+	PORT_GP_CFG_17(2, fn, sfx, SH_PFC_PIN_CFG_IO_VOLTAGE),		\
+	PORT_GP_CFG_17(3, fn, sfx, SH_PFC_PIN_CFG_IO_VOLTAGE),		\
+	PORT_GP_6(4,  fn, sfx),						\
+	PORT_GP_15(5, fn, sfx)
 /*
  * F_() : just information
  * FM() : macro for FN_xxx / xxx_MARK

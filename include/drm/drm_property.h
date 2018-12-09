@@ -27,6 +27,8 @@
 #include <linux/ctype.h>
 #include <drm/drm_mode_object.h>
 
+#include <uapi/drm/drm_mode.h>
+
 /**
  * struct drm_property_enum - symbolic values for enumerations
  * @value: numeric property value for this enum entry
@@ -147,10 +149,10 @@ struct drm_property {
 	 *     properties are not exposed to legacy userspace.
 	 *
 	 * DRM_MODE_PROP_IMMUTABLE
-	 *     Set for properties where userspace cannot be changed by
+	 *     Set for properties whose values cannot be changed by
 	 *     userspace. The kernel is allowed to update the value of these
 	 *     properties. This is generally used to expose probe state to
-	 *     usersapce, e.g. the EDID, or the connector path property on DP
+	 *     userspace, e.g. the EDID, or the connector path property on DP
 	 *     MST sinks.
 	 */
 	uint32_t flags;

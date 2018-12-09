@@ -1,12 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * Copyright (c) Atmel Corporation.  All rights reserved.
- *
- * Module Name:  wilc_sdio.c
+ * Copyright (c) 2012 - 2018 Microchip Technology Inc., and its subsidiaries.
+ * All rights reserved.
  */
 
 #include <linux/mmc/sdio_func.h>
-#include <linux/of_gpio.h>
+#include <linux/mmc/host.h>
 
 #include "wilc_wfi_netdevice.h"
 
@@ -31,7 +30,6 @@ struct wilc_sdio {
 	int has_thrpt_enh3;
 };
 
-static struct wilc_sdio g_sdio;
 static const struct wilc_hif_func wilc_hif_sdio;
 
 static int sdio_write_reg(struct wilc *wilc, u32 addr, u32 data);
@@ -108,24 +106,35 @@ static int linux_sdio_probe(struct sdio_func *func,
 			    const struct sdio_device_id *id)
 {
 	struct wilc *wilc;
-	int gpio, ret;
+	int ret;
+	struct gpio_desc *gpio = NULL;
+	struct wilc_sdio *sdio_priv;
 
-	gpio = -1;
+	sdio_priv = kzalloc(sizeof(*sdio_priv), GFP_KERNEL);
+	if (!sdio_priv)
+		return -ENOMEM;
+
 	if (IS_ENABLED(CONFIG_WILC1000_HW_OOB_INTR)) {
-		gpio = of_get_gpio(func->dev.of_node, 0);
-		if (gpio < 0)
-			gpio = GPIO_NUM;
+		gpio = gpiod_get(&func->dev, "irq", GPIOD_IN);
+		if (IS_ERR(gpio)) {
+			/* get the GPIO descriptor from hardcode GPIO number */
+			gpio = gpio_to_desc(GPIO_NUM);
+			if (!gpio)
+				dev_err(&func->dev, "failed to get irq gpio\n");
+		}
 	}
 
 	dev_dbg(&func->dev, "Initializing netdev\n");
-	ret = wilc_netdev_init(&wilc, &func->dev, HIF_SDIO, gpio,
-			       &wilc_hif_sdio);
+	ret = wilc_netdev_init(&wilc, &func->dev, HIF_SDIO, &wilc_hif_sdio);
 	if (ret) {
 		dev_err(&func->dev, "Couldn't initialize netdev\n");
+		kfree(sdio_priv);
 		return ret;
 	}
 	sdio_set_drvdata(func, wilc);
+	wilc->bus_data = sdio_priv;
 	wilc->dev = &func->dev;
+	wilc->gpio_irq = gpio;
 
 	dev_info(&func->dev, "Driver Initializing success\n");
 	return 0;
@@ -133,7 +142,12 @@ static int linux_sdio_probe(struct sdio_func *func,
 
 static void linux_sdio_remove(struct sdio_func *func)
 {
-	wilc_netdev_cleanup(sdio_get_drvdata(func));
+	struct wilc *wilc = sdio_get_drvdata(func);
+
+	/* free the GPIO in module remove */
+	if (wilc->gpio_irq)
+		gpiod_put(wilc->gpio_irq);
+	wilc_netdev_cleanup(wilc);
 }
 
 static int sdio_reset(struct wilc *wilc)
@@ -199,21 +213,28 @@ static int wilc_sdio_resume(struct device *dev)
 	return 0;
 }
 
+static const struct of_device_id wilc_of_match[] = {
+	{ .compatible = "microchip,wilc1000-sdio", },
+	{ /* sentinel */ }
+};
+MODULE_DEVICE_TABLE(of, wilc_of_match);
+
 static const struct dev_pm_ops wilc_sdio_pm_ops = {
 	.suspend = wilc_sdio_suspend,
 	.resume = wilc_sdio_resume,
 };
 
-static struct sdio_driver wilc1000_sdio_driver = {
+static struct sdio_driver wilc_sdio_driver = {
 	.name		= SDIO_MODALIAS,
 	.id_table	= wilc_sdio_ids,
 	.probe		= linux_sdio_probe,
 	.remove		= linux_sdio_remove,
 	.drv = {
 		.pm = &wilc_sdio_pm_ops,
+		.of_match_table = wilc_of_match,
 	}
 };
-module_driver(wilc1000_sdio_driver,
+module_driver(wilc_sdio_driver,
 	      sdio_register_driver,
 	      sdio_unregister_driver);
 MODULE_LICENSE("GPL");
@@ -366,9 +387,10 @@ fail:
 static int sdio_write_reg(struct wilc *wilc, u32 addr, u32 data)
 {
 	struct sdio_func *func = dev_to_sdio_func(wilc->dev);
+	struct wilc_sdio *sdio_priv = wilc->bus_data;
 	int ret;
 
-	data = cpu_to_le32(data);
+	cpu_to_le32s(&data);
 
 	if (addr >= 0xf0 && addr <= 0xff) {
 		struct sdio_cmd52 cmd;
@@ -400,7 +422,7 @@ static int sdio_write_reg(struct wilc *wilc, u32 addr, u32 data)
 		cmd.increment = 1;
 		cmd.count = 4;
 		cmd.buffer = (u8 *)&data;
-		cmd.block_size = g_sdio.block_size;
+		cmd.block_size = sdio_priv->block_size;
 		ret = wilc_sdio_cmd53(wilc, &cmd);
 		if (ret) {
 			dev_err(&func->dev,
@@ -419,7 +441,8 @@ fail:
 static int sdio_write(struct wilc *wilc, u32 addr, u8 *buf, u32 size)
 {
 	struct sdio_func *func = dev_to_sdio_func(wilc->dev);
-	u32 block_size = g_sdio.block_size;
+	struct wilc_sdio *sdio_priv = wilc->bus_data;
+	u32 block_size = sdio_priv->block_size;
 	struct sdio_cmd53 cmd;
 	int nblk, nleft, ret;
 
@@ -508,6 +531,7 @@ fail:
 static int sdio_read_reg(struct wilc *wilc, u32 addr, u32 *data)
 {
 	struct sdio_func *func = dev_to_sdio_func(wilc->dev);
+	struct wilc_sdio *sdio_priv = wilc->bus_data;
 	int ret;
 
 	if (addr >= 0xf0 && addr <= 0xff) {
@@ -538,7 +562,7 @@ static int sdio_read_reg(struct wilc *wilc, u32 addr, u32 *data)
 		cmd.count = 4;
 		cmd.buffer = (u8 *)data;
 
-		cmd.block_size = g_sdio.block_size;
+		cmd.block_size = sdio_priv->block_size;
 		ret = wilc_sdio_cmd53(wilc, &cmd);
 		if (ret) {
 			dev_err(&func->dev,
@@ -547,7 +571,7 @@ static int sdio_read_reg(struct wilc *wilc, u32 addr, u32 *data)
 		}
 	}
 
-	*data = cpu_to_le32(*data);
+	le32_to_cpus(data);
 
 	return 1;
 
@@ -559,7 +583,8 @@ fail:
 static int sdio_read(struct wilc *wilc, u32 addr, u8 *buf, u32 size)
 {
 	struct sdio_func *func = dev_to_sdio_func(wilc->dev);
-	u32 block_size = g_sdio.block_size;
+	struct wilc_sdio *sdio_priv = wilc->bus_data;
+	u32 block_size = sdio_priv->block_size;
 	struct sdio_cmd53 cmd;
 	int nblk, nleft, ret;
 
@@ -659,14 +684,13 @@ static int sdio_deinit(struct wilc *wilc)
 static int sdio_init(struct wilc *wilc, bool resume)
 {
 	struct sdio_func *func = dev_to_sdio_func(wilc->dev);
+	struct wilc_sdio *sdio_priv = wilc->bus_data;
 	struct sdio_cmd52 cmd;
 	int loop, ret;
 	u32 chipid;
 
-	if (!resume) {
-		memset(&g_sdio, 0, sizeof(struct wilc_sdio));
-		g_sdio.irq_gpio = wilc->dev_irq_num;
-	}
+	if (!resume)
+		sdio_priv->irq_gpio = wilc->dev_irq_num;
 
 	/**
 	 *      function 0 csa enable
@@ -689,7 +713,7 @@ static int sdio_init(struct wilc *wilc, bool resume)
 		dev_err(&func->dev, "Fail cmd 52, set func 0 block size...\n");
 		goto fail;
 	}
-	g_sdio.block_size = WILC_SDIO_BLOCK_SIZE;
+	sdio_priv->block_size = WILC_SDIO_BLOCK_SIZE;
 
 	/**
 	 *      enable func1 IO
@@ -763,11 +787,11 @@ static int sdio_init(struct wilc *wilc, bool resume)
 		}
 		dev_err(&func->dev, "chipid (%08x)\n", chipid);
 		if ((chipid & 0xfff) > 0x2a0)
-			g_sdio.has_thrpt_enh3 = 1;
+			sdio_priv->has_thrpt_enh3 = 1;
 		else
-			g_sdio.has_thrpt_enh3 = 0;
+			sdio_priv->has_thrpt_enh3 = 0;
 		dev_info(&func->dev, "has_thrpt_enh3 = %d...\n",
-			 g_sdio.has_thrpt_enh3);
+			 sdio_priv->has_thrpt_enh3);
 	}
 
 	return 1;
@@ -793,9 +817,6 @@ static int sdio_read_size(struct wilc *wilc, u32 *size)
 	wilc_sdio_cmd52(wilc, &cmd);
 	tmp = cmd.data;
 
-	/* cmd.read_write = 0; */
-	/* cmd.function = 0; */
-	/* cmd.raw = 0; */
 	cmd.address = 0xf3;
 	cmd.data = 0;
 	wilc_sdio_cmd52(wilc, &cmd);
@@ -808,6 +829,7 @@ static int sdio_read_size(struct wilc *wilc, u32 *size)
 static int sdio_read_int(struct wilc *wilc, u32 *int_status)
 {
 	struct sdio_func *func = dev_to_sdio_func(wilc->dev);
+	struct wilc_sdio *sdio_priv = wilc->bus_data;
 	u32 tmp;
 	struct sdio_cmd52 cmd;
 
@@ -816,7 +838,7 @@ static int sdio_read_int(struct wilc *wilc, u32 *int_status)
 	/**
 	 *      Read IRQ flags
 	 **/
-	if (!g_sdio.irq_gpio) {
+	if (!sdio_priv->irq_gpio) {
 		int i;
 
 		cmd.function = 1;
@@ -836,7 +858,7 @@ static int sdio_read_int(struct wilc *wilc, u32 *int_status)
 			tmp |= INT_4;
 		if (cmd.data & BIT(6))
 			tmp |= INT_5;
-		for (i = g_sdio.nint; i < MAX_NUM_INT; i++) {
+		for (i = sdio_priv->nint; i < MAX_NUM_INT; i++) {
 			if ((tmp >> (IRG_FLAGS_OFFSET + i)) & 0x1) {
 				dev_err(&func->dev,
 					"Unexpected interrupt (1) : tmp=%x, data=%x\n",
@@ -865,13 +887,14 @@ static int sdio_read_int(struct wilc *wilc, u32 *int_status)
 static int sdio_clear_int_ext(struct wilc *wilc, u32 val)
 {
 	struct sdio_func *func = dev_to_sdio_func(wilc->dev);
+	struct wilc_sdio *sdio_priv = wilc->bus_data;
 	int ret;
 	int vmm_ctl;
 
-	if (g_sdio.has_thrpt_enh3) {
+	if (sdio_priv->has_thrpt_enh3) {
 		u32 reg;
 
-		if (g_sdio.irq_gpio) {
+		if (sdio_priv->irq_gpio) {
 			u32 flags;
 
 			flags = val & (BIT(MAX_NUN_INT_THRPT_ENH2) - 1);
@@ -907,7 +930,7 @@ static int sdio_clear_int_ext(struct wilc *wilc, u32 val)
 		}
 		return 1;
 	}
-	if (g_sdio.irq_gpio) {
+	if (sdio_priv->irq_gpio) {
 		/* has_thrpt_enh2 uses register 0xf8 to clear interrupts. */
 		/*
 		 * Cannot clear multiple interrupts.
@@ -920,7 +943,7 @@ static int sdio_clear_int_ext(struct wilc *wilc, u32 val)
 			int i;
 
 			ret = 1;
-			for (i = 0; i < g_sdio.nint; i++) {
+			for (i = 0; i < sdio_priv->nint; i++) {
 				if (flags & 1) {
 					struct sdio_cmd52 cmd;
 
@@ -944,7 +967,7 @@ static int sdio_clear_int_ext(struct wilc *wilc, u32 val)
 			}
 			if (!ret)
 				goto fail;
-			for (i = g_sdio.nint; i < MAX_NUM_INT; i++) {
+			for (i = sdio_priv->nint; i < MAX_NUM_INT; i++) {
 				if (flags & 1)
 					dev_err(&func->dev,
 						"Unexpected interrupt cleared %d...\n",
@@ -989,6 +1012,7 @@ fail:
 static int sdio_sync_ext(struct wilc *wilc, int nint)
 {
 	struct sdio_func *func = dev_to_sdio_func(wilc->dev);
+	struct wilc_sdio *sdio_priv = wilc->bus_data;
 	u32 reg;
 
 	if (nint > MAX_NUM_INT) {
@@ -1001,7 +1025,7 @@ static int sdio_sync_ext(struct wilc *wilc, int nint)
 		return 0;
 	}
 
-	g_sdio.nint = nint;
+	sdio_priv->nint = nint;
 
 	/**
 	 *      Disable power sequencer
@@ -1017,7 +1041,7 @@ static int sdio_sync_ext(struct wilc *wilc, int nint)
 		return 0;
 	}
 
-	if (g_sdio.irq_gpio) {
+	if (sdio_priv->irq_gpio) {
 		u32 reg;
 		int ret, i;
 
@@ -1080,12 +1104,7 @@ static int sdio_sync_ext(struct wilc *wilc, int nint)
 	return 1;
 }
 
-/********************************************
- *
- *      Global sdio HIF function table
- *
- ********************************************/
-
+/* Global sdio HIF function table */
 static const struct wilc_hif_func wilc_hif_sdio = {
 	.hif_init = sdio_init,
 	.hif_deinit = sdio_deinit,

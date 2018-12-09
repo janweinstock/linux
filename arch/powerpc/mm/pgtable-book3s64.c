@@ -69,9 +69,14 @@ void set_pmd_at(struct mm_struct *mm, unsigned long addr,
 		pmd_t *pmdp, pmd_t pmd)
 {
 #ifdef CONFIG_DEBUG_VM
-	WARN_ON(pte_present(pmd_pte(*pmdp)) && !pte_protnone(pmd_pte(*pmdp)));
+	/*
+	 * Make sure hardware valid bit is not set. We don't do
+	 * tlb flush for this update.
+	 */
+
+	WARN_ON(pte_hw_valid(pmd_pte(*pmdp)) && !pte_protnone(pmd_pte(*pmdp)));
 	assert_spin_locked(pmd_lockptr(mm, pmdp));
-	WARN_ON(!(pmd_trans_huge(pmd) || pmd_devmap(pmd)));
+	WARN_ON(!(pmd_large(pmd) || pmd_devmap(pmd)));
 #endif
 	trace_hugepage_set_pmd(addr, pmd_val(pmd));
 	return set_pte_at(mm, addr, pmdp_ptep(pmdp), pmd_pte(pmd));
@@ -106,7 +111,7 @@ pmd_t pmdp_invalidate(struct vm_area_struct *vma, unsigned long address,
 {
 	unsigned long old_pmd;
 
-	old_pmd = pmd_hugepage_update(vma->vm_mm, address, pmdp, _PAGE_PRESENT, 0);
+	old_pmd = pmd_hugepage_update(vma->vm_mm, address, pmdp, _PAGE_PRESENT, _PAGE_INVALID);
 	flush_pmd_tlb_range(vma, address, address + HPAGE_PMD_SIZE);
 	/*
 	 * This ensures that generic code that rely on IRQ disabling
@@ -270,6 +275,8 @@ static pmd_t *__alloc_for_pmdcache(struct mm_struct *mm)
 		return NULL;
 	}
 
+	atomic_set(&page->pt_frag_refcount, 1);
+
 	ret = page_address(page);
 	/*
 	 * if we support only one fragment just return the
@@ -285,7 +292,7 @@ static pmd_t *__alloc_for_pmdcache(struct mm_struct *mm)
 	 * count.
 	 */
 	if (likely(!mm->context.pmd_frag)) {
-		set_page_count(page, PMD_FRAG_NR);
+		atomic_set(&page->pt_frag_refcount, PMD_FRAG_NR);
 		mm->context.pmd_frag = ret + PMD_FRAG_SIZE;
 	}
 	spin_unlock(&mm->page_table_lock);
@@ -308,9 +315,10 @@ void pmd_fragment_free(unsigned long *pmd)
 {
 	struct page *page = virt_to_page(pmd);
 
-	if (put_page_testzero(page)) {
+	BUG_ON(atomic_read(&page->pt_frag_refcount) <= 0);
+	if (atomic_dec_and_test(&page->pt_frag_refcount)) {
 		pgtable_pmd_page_dtor(page);
-		free_unref_page(page);
+		__free_page(page);
 	}
 }
 
@@ -352,6 +360,7 @@ static pte_t *__alloc_for_ptecache(struct mm_struct *mm, int kernel)
 			return NULL;
 	}
 
+	atomic_set(&page->pt_frag_refcount, 1);
 
 	ret = page_address(page);
 	/*
@@ -367,7 +376,7 @@ static pte_t *__alloc_for_ptecache(struct mm_struct *mm, int kernel)
 	 * count.
 	 */
 	if (likely(!mm->context.pte_frag)) {
-		set_page_count(page, PTE_FRAG_NR);
+		atomic_set(&page->pt_frag_refcount, PTE_FRAG_NR);
 		mm->context.pte_frag = ret + PTE_FRAG_SIZE;
 	}
 	spin_unlock(&mm->page_table_lock);
@@ -390,10 +399,11 @@ void pte_fragment_free(unsigned long *table, int kernel)
 {
 	struct page *page = virt_to_page(table);
 
-	if (put_page_testzero(page)) {
+	BUG_ON(atomic_read(&page->pt_frag_refcount) <= 0);
+	if (atomic_dec_and_test(&page->pt_frag_refcount)) {
 		if (!kernel)
 			pgtable_page_dtor(page);
-		free_unref_page(page);
+		__free_page(page);
 	}
 }
 
@@ -450,3 +460,25 @@ void pgtable_free_tlb(struct mmu_gather *tlb, void *table, int index)
 	return pgtable_free(table, index);
 }
 #endif
+
+#ifdef CONFIG_PROC_FS
+atomic_long_t direct_pages_count[MMU_PAGE_COUNT];
+
+void arch_report_meminfo(struct seq_file *m)
+{
+	/*
+	 * Hash maps the memory with one size mmu_linear_psize.
+	 * So don't bother to print these on hash
+	 */
+	if (!radix_enabled())
+		return;
+	seq_printf(m, "DirectMap4k:    %8lu kB\n",
+		   atomic_long_read(&direct_pages_count[MMU_PAGE_4K]) << 2);
+	seq_printf(m, "DirectMap64k:    %8lu kB\n",
+		   atomic_long_read(&direct_pages_count[MMU_PAGE_64K]) << 6);
+	seq_printf(m, "DirectMap2M:    %8lu kB\n",
+		   atomic_long_read(&direct_pages_count[MMU_PAGE_2M]) << 11);
+	seq_printf(m, "DirectMap1G:    %8lu kB\n",
+		   atomic_long_read(&direct_pages_count[MMU_PAGE_1G]) << 20);
+}
+#endif /* CONFIG_PROC_FS */

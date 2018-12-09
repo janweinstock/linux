@@ -474,7 +474,7 @@ static void broadwell_sseu_info_init(struct drm_i915_private *dev_priv)
 			u8 eu_disabled_mask;
 			u32 n_disabled;
 
-			if (!(sseu->subslice_mask[ss] & BIT(ss)))
+			if (!(sseu->subslice_mask[s] & BIT(ss)))
 				/* skip disabled subslice */
 				continue;
 
@@ -858,6 +858,8 @@ void intel_device_info_runtime_init(struct intel_device_info *info)
 void intel_driver_caps_print(const struct intel_driver_caps *caps,
 			     struct drm_printer *p)
 {
+	drm_printf(p, "Has logical contexts? %s\n",
+		   yesno(caps->has_logical_contexts));
 	drm_printf(p, "scheduler: %x\n", caps->scheduler);
 }
 

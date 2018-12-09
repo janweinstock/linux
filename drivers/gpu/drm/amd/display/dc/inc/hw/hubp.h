@@ -43,10 +43,9 @@ enum cursor_lines_per_chunk {
 };
 
 struct hubp {
-	struct hubp_funcs *funcs;
+	const struct hubp_funcs *funcs;
 	struct dc_context *ctx;
 	struct dc_plane_address request_address;
-	struct dc_plane_address current_address;
 	int inst;
 
 	/* run time states */
@@ -97,7 +96,8 @@ struct hubp_funcs {
 		union plane_size *plane_size,
 		enum dc_rotation_angle rotation,
 		struct dc_plane_dcc_param *dcc,
-		bool horizontal_mirror);
+		bool horizontal_mirror,
+		unsigned int compa_level);
 
 	bool (*hubp_is_flip_pending)(struct hubp *hubp);
 

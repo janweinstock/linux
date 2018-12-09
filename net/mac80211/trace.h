@@ -92,7 +92,7 @@
 				STA_ENTRY						\
 				__field(u16, tid)					\
 				__field(u16, ssn)					\
-				__field(u8, buf_size)					\
+				__field(u16, buf_size)					\
 				__field(bool, amsdu)					\
 				__field(u16, timeout)					\
 				__field(u16, action)
@@ -2597,6 +2597,29 @@ TRACE_EVENT(drv_wake_tx_queue,
 	TP_printk(
 		LOCAL_PR_FMT  VIF_PR_FMT  STA_PR_FMT " ac:%d tid:%d",
 		LOCAL_PR_ARG, VIF_PR_ARG, STA_PR_ARG, __entry->ac, __entry->tid
+	)
+);
+
+TRACE_EVENT(drv_get_ftm_responder_stats,
+	TP_PROTO(struct ieee80211_local *local,
+		 struct ieee80211_sub_if_data *sdata,
+		 struct cfg80211_ftm_responder_stats *ftm_stats),
+
+	TP_ARGS(local, sdata, ftm_stats),
+
+	TP_STRUCT__entry(
+		LOCAL_ENTRY
+		VIF_ENTRY
+	),
+
+	TP_fast_assign(
+		LOCAL_ASSIGN;
+		VIF_ASSIGN;
+	),
+
+	TP_printk(
+		LOCAL_PR_FMT VIF_PR_FMT,
+		LOCAL_PR_ARG, VIF_PR_ARG
 	)
 );
 

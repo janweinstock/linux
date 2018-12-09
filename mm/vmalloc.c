@@ -1577,6 +1577,8 @@ void vfree_atomic(const void *addr)
  *	have CONFIG_ARCH_HAVE_NMI_SAFE_CMPXCHG, but making the calling
  *	conventions for vfree() arch-depenedent would be a really bad idea)
  *
+ *	May sleep if called *not* from interrupt context.
+ *
  *	NOTE: assumes that the object at @addr has a size >= sizeof(llist_node)
  */
 void vfree(const void *addr)
@@ -1584,6 +1586,8 @@ void vfree(const void *addr)
 	BUG_ON(in_nmi());
 
 	kmemleak_free(addr);
+
+	might_sleep_if(!in_interrupt());
 
 	if (!addr)
 		return;
@@ -1906,10 +1910,6 @@ void *vzalloc_node(unsigned long size, int node)
 			 GFP_KERNEL | __GFP_ZERO);
 }
 EXPORT_SYMBOL(vzalloc_node);
-
-#ifndef PAGE_KERNEL_EXEC
-# define PAGE_KERNEL_EXEC PAGE_KERNEL
-#endif
 
 /**
  *	vmalloc_exec  -  allocate virtually contiguous, executable memory

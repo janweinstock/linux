@@ -118,7 +118,6 @@ static struct dentry *dfs_device_status;
 
 static u32 cpu_use[NR_CPUS];
 
-static DEFINE_SPINLOCK(rssd_index_lock);
 static DEFINE_IDA(rssd_index_ida);
 
 static int mtip_block_initialize(struct driver_data *dd);
@@ -1863,11 +1862,9 @@ static int exec_drive_taskfile(struct driver_data *dd,
 		if (IS_ERR(outbuf))
 			return PTR_ERR(outbuf);
 
-		outbuf_dma = pci_map_single(dd->pdev,
-					 outbuf,
-					 taskout,
-					 DMA_TO_DEVICE);
-		if (pci_dma_mapping_error(dd->pdev, outbuf_dma)) {
+		outbuf_dma = dma_map_single(&dd->pdev->dev, outbuf,
+					    taskout, DMA_TO_DEVICE);
+		if (dma_mapping_error(&dd->pdev->dev, outbuf_dma)) {
 			err = -ENOMEM;
 			goto abort;
 		}
@@ -1881,10 +1878,9 @@ static int exec_drive_taskfile(struct driver_data *dd,
 			inbuf = NULL;
 			goto abort;
 		}
-		inbuf_dma = pci_map_single(dd->pdev,
-					 inbuf,
-					 taskin, DMA_FROM_DEVICE);
-		if (pci_dma_mapping_error(dd->pdev, inbuf_dma)) {
+		inbuf_dma = dma_map_single(&dd->pdev->dev, inbuf,
+					   taskin, DMA_FROM_DEVICE);
+		if (dma_mapping_error(&dd->pdev->dev, inbuf_dma)) {
 			err = -ENOMEM;
 			goto abort;
 		}
@@ -1946,8 +1942,8 @@ static int exec_drive_taskfile(struct driver_data *dd,
 				dev_warn(&dd->pdev->dev,
 					"data movement but "
 					"sect_count is 0\n");
-					err = -EINVAL;
-					goto abort;
+				err = -EINVAL;
+				goto abort;
 			}
 		}
 	}
@@ -2003,11 +1999,11 @@ static int exec_drive_taskfile(struct driver_data *dd,
 
 	/* reclaim the DMA buffers.*/
 	if (inbuf_dma)
-		pci_unmap_single(dd->pdev, inbuf_dma,
-			taskin, DMA_FROM_DEVICE);
+		dma_unmap_single(&dd->pdev->dev, inbuf_dma, taskin,
+				 DMA_FROM_DEVICE);
 	if (outbuf_dma)
-		pci_unmap_single(dd->pdev, outbuf_dma,
-			taskout, DMA_TO_DEVICE);
+		dma_unmap_single(&dd->pdev->dev, outbuf_dma, taskout,
+				 DMA_TO_DEVICE);
 	inbuf_dma  = 0;
 	outbuf_dma = 0;
 
@@ -2054,11 +2050,11 @@ static int exec_drive_taskfile(struct driver_data *dd,
 	}
 abort:
 	if (inbuf_dma)
-		pci_unmap_single(dd->pdev, inbuf_dma,
-					taskin, DMA_FROM_DEVICE);
+		dma_unmap_single(&dd->pdev->dev, inbuf_dma, taskin,
+				 DMA_FROM_DEVICE);
 	if (outbuf_dma)
-		pci_unmap_single(dd->pdev, outbuf_dma,
-					taskout, DMA_TO_DEVICE);
+		dma_unmap_single(&dd->pdev->dev, outbuf_dma, taskout,
+				 DMA_TO_DEVICE);
 	kfree(outbuf);
 	kfree(inbuf);
 
@@ -2575,8 +2571,7 @@ static int mtip_hw_debugfs_init(struct driver_data *dd)
 
 static void mtip_hw_debugfs_exit(struct driver_data *dd)
 {
-	if (dd->dfs_node)
-		debugfs_remove_recursive(dd->dfs_node);
+	debugfs_remove_recursive(dd->dfs_node);
 }
 
 /*
@@ -3768,20 +3763,10 @@ static int mtip_block_initialize(struct driver_data *dd)
 		goto alloc_disk_error;
 	}
 
-	/* Generate the disk name, implemented same as in sd.c */
-	do {
-		if (!ida_pre_get(&rssd_index_ida, GFP_KERNEL)) {
-			rv = -ENOMEM;
-			goto ida_get_error;
-		}
-
-		spin_lock(&rssd_index_lock);
-		rv = ida_get_new(&rssd_index_ida, &index);
-		spin_unlock(&rssd_index_lock);
-	} while (rv == -EAGAIN);
-
-	if (rv)
+	rv = ida_alloc(&rssd_index_ida, GFP_KERNEL);
+	if (rv < 0)
 		goto ida_get_error;
+	index = rv;
 
 	rv = rssd_disk_name_format("rssd",
 				index,
@@ -3873,7 +3858,7 @@ skip_create_disk:
 	set_capacity(dd->disk, capacity);
 
 	/* Enable the block device and add it to /dev */
-	device_add_disk(&dd->pdev->dev, dd->disk);
+	device_add_disk(&dd->pdev->dev, dd->disk, NULL);
 
 	dd->bdev = bdget_disk(dd->disk, 0);
 	/*
@@ -3923,9 +3908,7 @@ block_queue_alloc_init_error:
 block_queue_alloc_tag_error:
 	mtip_hw_debugfs_exit(dd);
 disk_index_error:
-	spin_lock(&rssd_index_lock);
-	ida_remove(&rssd_index_ida, index);
-	spin_unlock(&rssd_index_lock);
+	ida_free(&rssd_index_ida, index);
 
 ida_get_error:
 	put_disk(dd->disk);
@@ -4013,9 +3996,7 @@ static int mtip_block_remove(struct driver_data *dd)
 	}
 	dd->disk  = NULL;
 
-	spin_lock(&rssd_index_lock);
-	ida_remove(&rssd_index_ida, dd->index);
-	spin_unlock(&rssd_index_lock);
+	ida_free(&rssd_index_ida, dd->index);
 
 	/* De-initialize the protocol layer. */
 	mtip_hw_exit(dd);
@@ -4055,9 +4036,7 @@ static int mtip_block_shutdown(struct driver_data *dd)
 		dd->queue = NULL;
 	}
 
-	spin_lock(&rssd_index_lock);
-	ida_remove(&rssd_index_ida, dd->index);
-	spin_unlock(&rssd_index_lock);
+	ida_free(&rssd_index_ida, dd->index);
 	return 0;
 }
 
@@ -4234,18 +4213,10 @@ static int mtip_pci_probe(struct pci_dev *pdev,
 		goto iomap_err;
 	}
 
-	if (!pci_set_dma_mask(pdev, DMA_BIT_MASK(64))) {
-		rv = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(64));
-
-		if (rv) {
-			rv = pci_set_consistent_dma_mask(pdev,
-						DMA_BIT_MASK(32));
-			if (rv) {
-				dev_warn(&pdev->dev,
-					"64-bit DMA enable failed\n");
-				goto setmask_err;
-			}
-		}
+	rv = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(64));
+	if (rv) {
+		dev_warn(&pdev->dev, "64-bit DMA enable failed\n");
+		goto setmask_err;
 	}
 
 	/* Copy the info we may need later into the private data structure. */

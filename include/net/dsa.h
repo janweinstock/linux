@@ -35,6 +35,7 @@ enum dsa_tag_protocol {
 	DSA_TAG_PROTO_BRCM_PREPEND,
 	DSA_TAG_PROTO_DSA,
 	DSA_TAG_PROTO_EDSA,
+	DSA_TAG_PROTO_GSWIP,
 	DSA_TAG_PROTO_KSZ,
 	DSA_TAG_PROTO_LAN9303,
 	DSA_TAG_PROTO_MTK,
@@ -258,6 +259,9 @@ struct dsa_switch {
 
 	/* Number of switch port queues */
 	unsigned int		num_tx_queues;
+
+	unsigned long		*bitmap;
+	unsigned long		_bitmap;
 
 	/* Dynamically allocated ports, keep last */
 	size_t num_ports;

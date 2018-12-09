@@ -33,6 +33,9 @@
 #include <asm/unistd.h>
 #include <asm/ptrace.h>
 #include <asm/export.h>
+#include <asm/asm-405.h>
+#include <asm/feature-fixups.h>
+#include <asm/barrier.h>
 
 /*
  * MSR_KERNEL is > 0x10000 on 4xx/Book-E since it include MSR_CE.
@@ -358,6 +361,15 @@ syscall_dotrace_cont:
 	ori	r10,r10,sys_call_table@l
 	slwi	r0,r0,2
 	bge-	66f
+
+	barrier_nospec_asm
+	/*
+	 * Prevent the load of the handler below (based on the user-passed
+	 * system call number) being speculatively executed until the test
+	 * against NR_syscalls and branch to .66f above has
+	 * committed.
+	 */
+
 	lwzx	r10,r10,r0	/* Fetch system call handler [ptr] */
 	mtlr	r10
 	addi	r9,r1,STACK_FRAME_OVERHEAD
@@ -782,7 +794,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_601)
 	lis	r10,MSR_KERNEL@h
 	ori	r10,r10,MSR_KERNEL@l
 	bl	transfer_to_handler_full
-	.long	nonrecoverable_exception
+	.long	unrecoverable_exception
 	.long	ret_from_except
 #endif
 
@@ -1285,7 +1297,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_601)
 	rlwinm	r3,r3,0,0,30
 	stw	r3,_TRAP(r1)
 4:	addi	r3,r1,STACK_FRAME_OVERHEAD
-	bl	nonrecoverable_exception
+	bl	unrecoverable_exception
 	/* shouldn't return */
 	b	4b
 
