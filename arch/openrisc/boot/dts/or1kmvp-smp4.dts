@@ -22,7 +22,7 @@
 	};
 
 	chosen {
-		bootargs = "debug earlycon console=ttyS0,115200n8";
+		bootargs = "debug earlycon console=ttyS0,115200n8 video=ocfb:800x600-32@60";
 		stdout-path = "serial0:115200n8";
 	};
 
@@ -89,6 +89,18 @@
 		reg = <0x92000000 0x2000>;
 		interrupts = <4>;
 		big-endian;
+	};
+
+	framebuffer@93000000 {
+		compatible = "opencores,ocfb";
+		reg = <0x93000000 0x2000>;
+		interrupts = <5>;
+	};
+
+	keyboard@94000000 {
+		compatible = "opencores,kbd";
+		reg = <0x94000000 0x2000>;
+		interrupts = <6>;
 	};
 
 	ompic@98000000 {
