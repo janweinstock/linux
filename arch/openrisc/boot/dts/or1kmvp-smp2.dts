@@ -89,6 +89,11 @@
 		interrupts = <6>;
 	};
 
+	rtc@95000000 {
+		compatible = "maxim,ds1742";
+		reg = <0x95000000 0x2000>;
+	};
+
 	ompic@98000000 {
 		compatible = "openrisc,ompic";
 		reg = <0x98000000 0x2000>;
