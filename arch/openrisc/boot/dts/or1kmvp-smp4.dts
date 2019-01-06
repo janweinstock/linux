@@ -22,7 +22,7 @@
 	};
 
 	chosen {
-		bootargs = "debug earlycon console=ttyS0,115200n8 video=ocfb:800x600-32@60";
+		bootargs = "debug earlycon console=ttyS0,115200n8 video=ocfb:800x600-32@60 root=/dev/mmcblk0p1 rw rootwait";
 		stdout-path = "serial0:115200n8";
 	};
 
@@ -106,6 +106,25 @@
 	rtc@95000000 {
 		compatible = "maxim,ds1742";
 		reg = <0x95000000 0x2000>;
+	};
+
+	spi@96000000 {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		compatible = "opencores,tiny-spi-rtlsvn2";
+		reg = <0x96000000 0x2000>;
+		/*interrupts = <7>;*/
+		gpios = <>;
+		clock-frequency = <50000000>;
+		baud-width = <32>;
+
+		mmc@0 {
+			compatible = "mmc-spi-slot";
+			reg = <0>;
+			voltage-ranges = <3300 3300>;
+			spi-max-frequency = <10000000>;
+		};
 	};
 
 	ompic@98000000 {
