@@ -129,5 +129,12 @@
 		interrupts = <1>;
 	};
 
+	rng@99000000 {
+		compatible = "timeriomem_rng";
+		reg = <0x99000000 0x4>;
+		quality = <1000>;
+		period = <0>;
+	};
+
 };
 
